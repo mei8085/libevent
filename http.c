@@ -2225,21 +2225,98 @@ evhttp_add_header_internal(struct evkeyvalq *headers,
  *   ALL_DATA_READ       when all headers have been read.
  */
 
+/* Read one line terminated by a strict CRLF ("\r\n") sequence from the
+ * front of 'buffer' and hand back a NUL-terminated copy (without the
+ * CRLF) in *line_out / *len_out.
+ *
+ * Unlike evbuffer_readln() with EVBUFFER_EOL_CRLF, this reader only
+ * accepts CRLF as the line terminator.  A bare LF (or a CR not followed
+ * by LF) is rejected instead of being silently treated as a terminator:
+ * accepting different line endings than the next hop creates parser
+ * mismatch / request smuggling opportunities.  A NUL or a stray CR inside
+ * the line content is rejected for the same reason (RFC 9110).
+ *
+ * Returns:
+ *   ALL_DATA_READ       a complete CRLF-terminated line was removed,
+ *   MORE_DATA_EXPECTED  no complete line yet; nothing was removed,
+ *   DATA_CORRUPTED      the pending bytes cannot start a valid line;
+ *                       nothing was removed so the caller retains state.
+ * On success *line_out must be released with mm_free().
+ */
+static enum message_read_status
+evhttp_read_strict_crlf_line_(struct evbuffer *buffer,
+    char **line_out, size_t *len_out)
+{
+	struct evbuffer_ptr lf;
+	size_t linelen, i;
+	unsigned char *data;
+	char *line;
+
+	*line_out = NULL;
+	*len_out = 0;
+
+	lf = evbuffer_search(buffer, "\n", 1, NULL);
+	if (lf.pos < 0)
+		return (MORE_DATA_EXPECTED);
+
+	linelen = (size_t)lf.pos;
+
+	/* Expose the pending bytes so the line content can be validated
+	 * before anything is consumed. */
+	data = evbuffer_pullup(buffer, linelen + 1);
+	if (data == NULL)
+		return (DATA_CORRUPTED);
+
+	/* The byte immediately before LF must be CR; a bare LF (or an
+	 * empty line terminated by LF alone) is a non-CRLF line ending. */
+	if (linelen == 0 || data[linelen - 1] != '\r')
+		return (DATA_CORRUPTED);
+
+	/* Validate the line content (excluding the terminating CR): no
+	 * NUL and no stray CR.  Both are illegal inside an HTTP field or
+	 * request/status line and enable parser mismatch attacks. */
+	for (i = 0; i + 1 < linelen; ++i) {
+		if (data[i] == '\0' || data[i] == '\r')
+			return (DATA_CORRUPTED);
+	}
+
+	line = mm_malloc(linelen - 1 + 1);
+	if (line == NULL) {
+		event_warn("%s: malloc", __func__);
+		return (DATA_CORRUPTED);
+	}
+
+	memcpy(line, data, linelen - 1);
+	line[linelen - 1] = '\0';
+
+	evbuffer_drain(buffer, linelen + 1); /* remove the line and CRLF */
+
+	*line_out = line;
+	*len_out = linelen - 1;
+	return (ALL_DATA_READ);
+}
+
 enum message_read_status
 evhttp_parse_firstline_(struct evhttp_request *req, struct evbuffer *buffer)
 {
-	char *line;
+	char *line = NULL;
 	enum message_read_status status = ALL_DATA_READ;
+	enum message_read_status read_status;
 
-	size_t len;
-	/* XXX try */
-	line = evbuffer_readln(buffer, &len, EVBUFFER_EOL_CRLF);
-	if (line == NULL) {
+	size_t len = 0;
+
+	read_status = evhttp_read_strict_crlf_line_(buffer, &line, &len);
+	if (read_status == MORE_DATA_EXPECTED) {
 		if (req->evcon != NULL &&
 		    evbuffer_get_length(buffer) > req->evcon->max_headers_size)
 			return (DATA_TOO_LONG);
 		else
 			return (MORE_DATA_EXPECTED);
+	} else if (read_status == DATA_CORRUPTED) {
+		/* Non-CRLF line ending or illegal byte in the request /
+		 * status line: surface a distinguishable parse failure
+		 * instead of accepting a malformed first line. */
+		return (DATA_CORRUPTED);
 	}
 
 	if (req->evcon != NULL && len > req->evcon->max_headers_size) {
@@ -2308,11 +2385,24 @@ evhttp_parse_headers_impl_(
 	enum message_read_status status = MORE_DATA_EXPECTED;
 
 	size_t len;
-	while ((line = evbuffer_readln(buffer, &len, EVBUFFER_EOL_CRLF))
-	       != NULL) {
+	for (;;) {
 		char *skey, *svalue;
+		enum message_read_status read_status;
 
-		req->headers_size += len;
+		read_status =
+		    evhttp_read_strict_crlf_line_(buffer, &line, &len);
+		if (read_status == MORE_DATA_EXPECTED)
+			break;
+		if (read_status == DATA_CORRUPTED)
+			return (DATA_CORRUPTED);
+
+		/* 'len' counts the line content without the CRLF, so keep
+		 * two extra bytes to account for the terminator itself. */
+		if (req->headers_size > EV_SIZE_MAX - (len + 2)) {
+			errcode = DATA_TOO_LONG;
+			goto error;
+		}
+		req->headers_size += len + 2;
 
 		if (req->evcon != NULL &&
 		    req->headers_size > req->evcon->max_headers_size) {
@@ -2328,6 +2418,10 @@ evhttp_parse_headers_impl_(
 
 		/* Check if this is a continuation line */
 		if (*line == ' ' || *line == '\t') {
+			/* A continuation line with no preceding header is
+			 * malformed; evhttp_append_to_last_header() reports
+			 * that so it surfaces as DATA_CORRUPTED rather than
+			 * being silently dropped. */
 			if (evhttp_append_to_last_header(headers, line) == -1)
 				goto error;
 			mm_free(line);

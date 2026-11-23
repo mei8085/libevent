@@ -56,6 +56,7 @@
 
 #include "event2/event.h"
 #include "event2/http.h"
+#include "event2/http_struct.h"
 #include "event2/buffer.h"
 #include "event2/bufferevent.h"
 #include "event2/bufferevent_ssl.h"
@@ -2897,6 +2898,216 @@ http_bad_header_test(void *ptr)
 	tt_want(evhttp_add_header(&headers, "One", "Two\n") == -1);
 
 	evhttp_clear_headers(&headers);
+}
+
+/* Directly exercise the request-line / header-block parsing boundary checks:
+ * strict CRLF line endings, illegal NUL/CR bytes, and header folding rules.
+ * Legal inputs keep their legacy parse results; malformed inputs surface as
+ * DATA_CORRUPTED (distinguishable from MORE_DATA_EXPECTED / DATA_TOO_LONG)
+ * without consuming the offending bytes, so each request keeps isolated
+ * parser state.
+ */
+static void
+http_parse_boundary_test(void *ptr)
+{
+	struct evbuffer *buf = NULL;
+	struct evbuffer *buf2 = NULL;
+	struct evhttp_request *req = NULL;
+	struct evhttp_request *req2 = NULL;
+	enum message_read_status st;
+
+#define FRESH_PARSER(input)                                                  \
+	do {                                                                 \
+		if (req)                                                     \
+			evhttp_request_free(req);                            \
+		if (buf)                                                     \
+			evbuffer_free(buf);                                  \
+		req = evhttp_request_new(NULL, NULL);                        \
+		tt_assert(req);                                              \
+		req->kind = EVHTTP_REQUEST;                                  \
+		buf = evbuffer_new();                                        \
+		tt_assert(buf);                                              \
+		evbuffer_add(buf, (input), sizeof(input) - 1);               \
+	} while (0)
+
+	/* 1. Legal request line plus a folded header: the continuation line
+	 * is joined to the previous value with a single space (legacy). */
+	{
+		const char input[] =
+		    "GET /a HTTP/1.1\r\n"
+		    "X: foo\r\n"
+		    " bar\r\n"
+		    "\r\n";
+		FRESH_PARSER(input);
+		tt_int_op(evhttp_parse_firstline_(req, buf), ==, ALL_DATA_READ);
+		tt_int_op(evhttp_parse_headers_(req, buf), ==, ALL_DATA_READ);
+		tt_str_op(evhttp_find_header(
+		    evhttp_request_get_input_headers(req), "X"), ==, "foo bar");
+	}
+
+	/* 2. Multiple continuation lines, including a tab-led fold. */
+	{
+		const char input[] =
+		    "GET /a HTTP/1.1\r\n"
+		    "X: foo\r\n"
+		    "\tbar\r\n"
+		    " baz\r\n"
+		    "\r\n";
+		FRESH_PARSER(input);
+		tt_int_op(evhttp_parse_firstline_(req, buf), ==, ALL_DATA_READ);
+		tt_int_op(evhttp_parse_headers_(req, buf), ==, ALL_DATA_READ);
+		tt_str_op(evhttp_find_header(
+		    evhttp_request_get_input_headers(req), "X"), ==,
+		    "foo bar baz");
+	}
+
+	/* 3. Bare LF terminating the request line: rejected, and the bytes
+	 * are left in the buffer so callers observe no partial parse. */
+	{
+		const char input[] =
+		    "GET /a HTTP/1.1\n"
+		    "Host: h\r\n"
+		    "\r\n";
+		FRESH_PARSER(input);
+		st = evhttp_parse_firstline_(req, buf);
+		tt_int_op(st, ==, DATA_CORRUPTED);
+		tt_int_op(evbuffer_get_length(buf), ==, sizeof(input) - 1);
+	}
+
+	/* 4. Bare LF inside the header block. */
+	{
+		const char input[] =
+		    "GET /a HTTP/1.1\r\n"
+		    "Host: h\n"
+		    "X: y\r\n"
+		    "\r\n";
+		FRESH_PARSER(input);
+		tt_int_op(evhttp_parse_firstline_(req, buf), ==, ALL_DATA_READ);
+		tt_int_op(evhttp_parse_headers_(req, buf), ==, DATA_CORRUPTED);
+	}
+
+	/* 5. NUL byte inside the request line. */
+	{
+		const char input[] =
+		    "GE\000 /a HTTP/1.1\r\n"
+		    "\r\n";
+		FRESH_PARSER(input);
+		tt_int_op(evhttp_parse_firstline_(req, buf), ==, DATA_CORRUPTED);
+	}
+
+	/* 6. NUL byte inside a header field value. */
+	{
+		const char input[] =
+		    "GET /a HTTP/1.1\r\n"
+		    "X: a\000" "b\r\n"
+		    "\r\n";
+		FRESH_PARSER(input);
+		tt_int_op(evhttp_parse_firstline_(req, buf), ==, ALL_DATA_READ);
+		tt_int_op(evhttp_parse_headers_(req, buf), ==, DATA_CORRUPTED);
+	}
+
+	/* 7. Stray CR not followed by LF inside a header line. */
+	{
+		const char input[] =
+		    "GET /a HTTP/1.1\r\n"
+		    "X: a\rb\r\n"
+		    "\r\n";
+		FRESH_PARSER(input);
+		tt_int_op(evhttp_parse_firstline_(req, buf), ==, ALL_DATA_READ);
+		tt_int_op(evhttp_parse_headers_(req, buf), ==, DATA_CORRUPTED);
+	}
+
+	/* 8. A continuation line with no preceding header has nothing to
+	 * fold into and must be rejected instead of silently dropped. */
+	{
+		const char input[] =
+		    "GET /a HTTP/1.1\r\n"
+		    " orphan\r\n"
+		    "\r\n";
+		FRESH_PARSER(input);
+		tt_int_op(evhttp_parse_firstline_(req, buf), ==, ALL_DATA_READ);
+		tt_int_op(evhttp_parse_headers_(req, buf), ==, DATA_CORRUPTED);
+	}
+
+	/* 9. Header line without a field-name/value separator. */
+	{
+		const char input[] =
+		    "GET /a HTTP/1.1\r\n"
+		    "BadHeader\r\n"
+		    "\r\n";
+		FRESH_PARSER(input);
+		tt_int_op(evhttp_parse_firstline_(req, buf), ==, ALL_DATA_READ);
+		tt_int_op(evhttp_parse_headers_(req, buf), ==, DATA_CORRUPTED);
+	}
+
+	/* 10. Legal baseline: plain headers and an empty field value. */
+	{
+		const char input[] =
+		    "GET /a HTTP/1.1\r\n"
+		    "Host: h\r\n"
+		    "Empty:\r\n"
+		    "\r\n";
+		FRESH_PARSER(input);
+		tt_int_op(evhttp_parse_firstline_(req, buf), ==, ALL_DATA_READ);
+		tt_int_op(evhttp_parse_headers_(req, buf), ==, ALL_DATA_READ);
+		tt_str_op(evhttp_find_header(
+		    evhttp_request_get_input_headers(req), "Host"), ==, "h");
+		tt_str_op(evhttp_find_header(
+		    evhttp_request_get_input_headers(req), "Empty"), ==, "");
+	}
+
+	/* 11. Incremental delivery: an incomplete line waits for more data
+	 * without consuming anything, then parses once CRLF arrives. */
+	{
+		const char part1[] = "GET /a HTTP/1.";
+		const char part2[] = "1\r\nHost: h\r\n\r\n";
+		FRESH_PARSER(part1);
+		tt_int_op(evhttp_parse_firstline_(req, buf), ==,
+		    MORE_DATA_EXPECTED);
+		tt_int_op(evbuffer_get_length(buf), ==, sizeof(part1) - 1);
+		evbuffer_add(buf, part2, sizeof(part2) - 1);
+		tt_int_op(evhttp_parse_firstline_(req, buf), ==, ALL_DATA_READ);
+		tt_int_op(evhttp_parse_headers_(req, buf), ==, ALL_DATA_READ);
+	}
+
+	/* 12. State isolation: a malformed message on one request object has
+	 * no effect on an independent request object. */
+	{
+		const char bad_input[] =
+		    "GET /a HTTP/1.1\n"
+		    "\r\n";
+		const char good_input[] =
+		    "GET /b HTTP/1.1\r\n"
+		    "Host: h\r\n"
+		    "\r\n";
+		FRESH_PARSER(bad_input);
+		tt_int_op(evhttp_parse_firstline_(req, buf), ==, DATA_CORRUPTED);
+
+		req2 = evhttp_request_new(NULL, NULL);
+		tt_assert(req2);
+		req2->kind = EVHTTP_REQUEST;
+		buf2 = evbuffer_new();
+		tt_assert(buf2);
+		evbuffer_add(buf2, good_input, sizeof(good_input) - 1);
+		tt_int_op(evhttp_parse_firstline_(req2, buf2), ==, ALL_DATA_READ);
+		tt_int_op(evhttp_parse_headers_(req2, buf2), ==, ALL_DATA_READ);
+		tt_str_op(evhttp_find_header(
+		    evhttp_request_get_input_headers(req2), "Host"), ==, "h");
+
+		/* The failed request still holds its unparsed bytes. */
+		tt_int_op(evbuffer_get_length(buf), ==, sizeof(bad_input) - 1);
+	}
+
+#undef FRESH_PARSER
+end:
+	if (req2)
+		evhttp_request_free(req2);
+	if (req)
+		evhttp_request_free(req);
+	if (buf2)
+		evbuffer_free(buf2);
+	if (buf)
+		evbuffer_free(buf);
 }
 
 static int validate_header(
@@ -6160,6 +6371,7 @@ struct testcase_t http_testcases[] = {
 	{ "primitives", http_primitives, 0, NULL, NULL },
 	{ "base", http_base_test, TT_FORK, NULL, NULL },
 	{ "bad_headers", http_bad_header_test, 0, NULL, NULL },
+	{ "parse_boundary", http_parse_boundary_test, 0, NULL, NULL },
 	{ "parse_query", http_parse_query_test, 0, NULL, NULL },
 	{ "parse_query_str", http_parse_query_str_test, 0, NULL, NULL },
 	{ "parse_query_str_flags", http_parse_query_str_flags_test, 0, NULL, NULL },
