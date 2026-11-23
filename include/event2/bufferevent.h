@@ -560,12 +560,22 @@ int bufferevent_set_timeouts(struct bufferevent *bufev,
   On output, the user write callback is invoked whenever the buffered data
   falls below the low watermark.  Filters that write to this bufev will try
   not to write more bytes to this buffer than the high watermark would allow,
-  except when flushing.
+  except when flushing.  Once a filter has filled the output buffer up to the
+  high watermark it is resumed as soon as the buffer drains back below it, so
+  the high watermark acts as real back pressure rather than a permanent stall.
+
+  Since this function cannot report an error, an inconsistent read request
+  (a nonzero high watermark smaller than the low watermark) is silently
+  raised to the low watermark so that the bufferevent can always make
+  progress.  bufferevent_getwatermark() reports the effective value that was
+  stored.  Use bufferevent_setwatermark_checked() if you need to observe
+  such adjustments as an error.
 
   @param bufev the bufferevent to be modified. bufev must not be NULL.
   @param events EV_READ, EV_WRITE or both
   @param lowmark the lower watermark to set
   @param highmark the high watermark to set
+  @see bufferevent_setwatermark_checked()
 */
 
 EVENT2_EXPORT_SYMBOL
@@ -573,9 +583,39 @@ void bufferevent_setwatermark(struct bufferevent *bufev, short events,
     size_t lowmark, size_t highmark);
 
 /**
+  Sets the watermarks for read and write events, reporting invalid requests.
+
+  This behaves like bufferevent_setwatermark(), except that an invalid request
+  is rejected instead of being silently adjusted.  A request is invalid when
+  'events' contains neither EV_READ nor EV_WRITE (or contains other bits), or
+  when it sets EV_READ with a nonzero high watermark smaller than the low
+  watermark -- a combination that would suspend reading below the level the
+  read callback needs to run.
+
+  A rejected request modifies nothing: all watermarks keep their previous
+  values, errno is set to EINVAL and -1 is returned, so a later valid call is
+  unaffected.  On out-of-memory errno is set to ENOMEM and likewise nothing is
+  changed.
+
+  @param bufev the bufferevent to be modified. bufev must not be NULL.
+  @param events EV_READ, EV_WRITE or both
+  @param lowmark the lower watermark to set
+  @param highmark the high watermark to set
+  @return 0 on success, or -1 with errno set (EINVAL or ENOMEM) on failure
+  @see bufferevent_setwatermark()
+*/
+EVENT2_EXPORT_SYMBOL
+int bufferevent_setwatermark_checked(struct bufferevent *bufev, short events,
+    size_t lowmark, size_t highmark);
+
+/**
   Retrieves the watermarks for read or write events.
   Returns non-zero if events contains not only EV_READ or EV_WRITE.
   Returns zero if events equal EV_READ or EV_WRITE
+
+  Only the values that were actually stored are reported; in particular, a
+  read high watermark that was raised to the read low watermark by
+  bufferevent_setwatermark() is reported in its adjusted form.
 
   @param bufev the bufferevent to be examined
   @param events EV_READ or EV_WRITE

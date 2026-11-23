@@ -107,45 +107,123 @@ bufferevent_unsuspend_write_(struct bufferevent *bufev, bufferevent_suspend_flag
 	BEV_UNLOCK(bufev);
 }
 
-/**
- * Sometimes bufferevent's implementation can overrun high watermarks
- * (one of examples is openssl) and in this case if the read callback
- * will not handle enough data do over condition above the read
- * callback will never be called again (due to suspend above).
+/* === Watermarks ===
  *
- * To avoid this we are scheduling read callback again here, but only
- * from the user callback to avoid multiple scheduling:
- * - when the data had been added to it
- * - when the data had been drained from it (user specified read callback)
+ * Two mechanisms share the term "watermark":
+ *
+ *  - Read watermarks.  The low watermark gates when the read callback may
+ *    run; the high watermark suspends reading from the network.  Some
+ *    backends (notably openssl) can overrun the high watermark because a
+ *    single SSL record is larger than the requested amount.  When that
+ *    happens the read callback must still run, or the overrun data would sit
+ *    in the input buffer forever with reading suspended.
+ *
+ *  - Write watermarks.  The low watermark gates when the write callback runs
+ *    ("tell me when my output has drained this much").  The high watermark
+ *    caps how far a filter may fill our output buffer; filters resume as soon
+ *    as the buffer drains back below the high watermark (see
+ *    bufferevent_filter.c).
+ *
+ * The state below is guarded by the bufferevent lock.  Helpers called from an
+ * evbuffer callback take the lock themselves; the others require the caller
+ * to hold it.
  */
-static void bufferevent_inbuf_wm_check(struct bufferevent *bev)
+
+/* Normalize a read watermark pair.  0 still means "no watermark" for
+ * 'high'.  A nonzero high watermark smaller than the low watermark would
+ * suspend reading below the level the read callback needs to run, so the
+ * callback could never fire and the bufferevent would deadlock.  Such a
+ * request is deterministically raised to the low watermark so that the
+ * bufferevent can always make progress.
+ *
+ * (The write pair needs no such adjustment: its high watermark is only an
+ * upper bound for filters and never gates the write callback.)
+ *
+ * Returns 0 on success.  With 'strict' set an inconsistent pair is reported
+ * as EINVAL instead of being adjusted. */
+static int
+bufferevent_wm_normalize_read_(size_t lowmark, size_t highmark, int strict,
+    size_t *normalized)
 {
+	size_t eff = highmark;
+
+	if (highmark && highmark < lowmark)
+		eff = lowmark;
+	if (strict && eff != highmark) {
+		errno = EINVAL;
+		return -1;
+	}
+	*normalized = eff;
+	return 0;
+}
+
+/* Re-evaluate read watermarks after the input buffer changed or after the
+ * watermark was reconfigured.  Requires the bufferevent lock. */
+void
+bufferevent_wm_check_read_(struct bufferevent *bufev)
+{
+	struct bufferevent_private *bufev_private = BEV_UPCAST(bufev);
+	size_t len;
+
+	if (!bufev->wm_read.high) {
+		bufferevent_wm_unsuspend_read(bufev);
+		bufev_private->wm_read_overrun_notified = 0;
+		bufev_private->wm_read_overrun_size = 0;
+		return;
+	}
+
+	len = evbuffer_get_length(bufev->input);
+	if (len >= bufev->wm_read.high) {
+		bufferevent_wm_suspend_read(bufev);
+	} else {
+		bufferevent_wm_unsuspend_read(bufev);
+		/* Reading can make progress again; allow one fresh forced read
+		 * callback on the next overrun. */
+		bufev_private->wm_read_overrun_notified = 0;
+		bufev_private->wm_read_overrun_size = 0;
+	}
+}
+
+/* Called by the evbuffer layer on input-buffer changes; the bufferevent lock
+ * is not held there, so take it before touching our state. */
+static void
+bufferevent_inbuf_wm_cb(struct evbuffer *buf,
+    const struct evbuffer_cb_info *cbinfo, void *arg)
+{
+	struct bufferevent *bufev = arg;
+
+	BEV_LOCK(bufev);
+	bufferevent_wm_check_read_(bufev);
+	BEV_UNLOCK(bufev);
+}
+
+/* After a read callback ran, notice whether the input buffer is still over the
+ * high watermark (overrun backends) and give the callback one more chance to
+ * drain it -- but only if the previous forced call actually made progress.
+ * A callback that keeps the buffer at least as large as last time must not be
+ * re-invoked in a loop, so a read callback that ignores its data cannot spin
+ * the event loop.  Requires the bufferevent lock. */
+static void
+bufferevent_inbuf_wm_check(struct bufferevent *bev)
+{
+	struct bufferevent_private *bev_p = BEV_UPCAST(bev);
+	size_t len;
+
 	if (!bev->wm_read.high)
 		return;
 	if (!(bev->enabled & EV_READ))
 		return;
-	if (evbuffer_get_length(bev->input) < bev->wm_read.high)
+	len = evbuffer_get_length(bev->input);
+	if (len < bev->wm_read.high) {
+		bev_p->wm_read_overrun_notified = 0;
+		bev_p->wm_read_overrun_size = 0;
 		return;
-
+	}
+	if (bev_p->wm_read_overrun_notified && len >= bev_p->wm_read_overrun_size)
+		return;
+	bev_p->wm_read_overrun_notified = 1;
+	bev_p->wm_read_overrun_size = len;
 	bufferevent_trigger(bev, EV_READ, BEV_OPT_DEFER_CALLBACKS);
-}
-
-/* Callback to implement watermarks on the input buffer.  Only enabled
- * if the watermark is set. */
-static void
-bufferevent_inbuf_wm_cb(struct evbuffer *buf,
-    const struct evbuffer_cb_info *cbinfo,
-    void *arg)
-{
-	struct bufferevent *bufev = arg;
-	size_t size;
-
-	size = evbuffer_get_length(buf);
-
-	if (size >= bufev->wm_read.high)
-		bufferevent_wm_suspend_read(bufev);
-	else
-		bufferevent_wm_unsuspend_read(bufev);
 }
 
 static void
@@ -595,11 +673,33 @@ bufferevent_disable(struct bufferevent *bufev, short event)
  * Sets the water marks
  */
 
-void
-bufferevent_setwatermark(struct bufferevent *bufev, short events,
-    size_t lowmark, size_t highmark)
+/* Shared implementation for bufferevent_setwatermark() and
+ * bufferevent_setwatermark_checked().  When 'strict' is nonzero an invalid
+ * request is rejected without touching any state; otherwise read/write
+ * watermarks are normalized so the result can always make progress.
+ *
+ * The operation is transactional: if any part of it fails (e.g. a callback
+ * entry cannot be allocated) all watermarks are restored to their previous
+ * values, so a failed call cannot leave reading suspended or a filter capped
+ * with no way to recover. */
+static int
+bufferevent_setwatermark_impl_(struct bufferevent *bufev, short events,
+    size_t lowmark, size_t highmark, int strict)
 {
 	struct bufferevent_private *bufev_private = BEV_UPCAST(bufev);
+	struct event_watermark old_read = bufev->wm_read;
+	struct event_watermark old_write = bufev->wm_write;
+	size_t eff_high = highmark;
+	int r = 0;
+
+	if (events == 0 || (events & ~(EV_READ|EV_WRITE))) {
+		errno = EINVAL;
+		return -1;
+	}
+	if ((events & EV_READ) &&
+	    bufferevent_wm_normalize_read_(lowmark, highmark, strict,
+		&eff_high) < 0)
+		return -1;
 
 	BEV_LOCK(bufev);
 	if (events & EV_WRITE) {
@@ -609,37 +709,72 @@ bufferevent_setwatermark(struct bufferevent *bufev, short events,
 
 	if (events & EV_READ) {
 		bufev->wm_read.low = lowmark;
-		bufev->wm_read.high = highmark;
+		bufev->wm_read.high = eff_high;
 
-		if (highmark) {
+		if (eff_high) {
 			/* There is now a new high-water mark for read.
 			   enable the callback if needed, and see if we should
 			   suspend/bufferevent_wm_unsuspend. */
-
 			if (bufev_private->read_watermarks_cb == NULL) {
 				bufev_private->read_watermarks_cb =
 				    evbuffer_add_cb(bufev->input,
 						    bufferevent_inbuf_wm_cb,
 						    bufev);
+				if (bufev_private->read_watermarks_cb == NULL) {
+					errno = ENOMEM;
+					r = -1;
+					goto rollback;
+				}
 			}
 			evbuffer_cb_set_flags(bufev->input,
 				      bufev_private->read_watermarks_cb,
 				      EVBUFFER_CB_ENABLED|EVBUFFER_CB_NODEFER);
-
-			if (evbuffer_get_length(bufev->input) >= highmark)
-				bufferevent_wm_suspend_read(bufev);
-			else if (evbuffer_get_length(bufev->input) < highmark)
-				bufferevent_wm_unsuspend_read(bufev);
-		} else {
+		} else if (bufev_private->read_watermarks_cb) {
 			/* There is now no high-water mark for read. */
-			if (bufev_private->read_watermarks_cb)
-				evbuffer_cb_clear_flags(bufev->input,
-				    bufev_private->read_watermarks_cb,
-				    EVBUFFER_CB_ENABLED);
-			bufferevent_wm_unsuspend_read(bufev);
+			evbuffer_cb_clear_flags(bufev->input,
+			    bufev_private->read_watermarks_cb,
+			    EVBUFFER_CB_ENABLED);
 		}
+		/* Re-evaluate the suspension for both the new and the cleared
+		 * case so a previously suspended bufferevent can resume. */
+		bufferevent_wm_check_read_(bufev);
 	}
 	BEV_UNLOCK(bufev);
+	return 0;
+
+rollback:
+	bufev->wm_read = old_read;
+	bufev->wm_write = old_write;
+	if (bufev_private->read_watermarks_cb) {
+		if (old_read.high)
+			evbuffer_cb_set_flags(bufev->input,
+			    bufev_private->read_watermarks_cb,
+			    EVBUFFER_CB_ENABLED|EVBUFFER_CB_NODEFER);
+		else
+			evbuffer_cb_clear_flags(bufev->input,
+			    bufev_private->read_watermarks_cb,
+			    EVBUFFER_CB_ENABLED);
+	}
+	bufferevent_wm_check_read_(bufev);
+	BEV_UNLOCK(bufev);
+	return r;
+}
+
+void
+bufferevent_setwatermark(struct bufferevent *bufev, short events,
+    size_t lowmark, size_t highmark)
+{
+	/* This API cannot report failure; the implementation only fails if it
+	 * cannot allocate the callback entry, in which case the normalized
+	 * watermarks are still stored. */
+	(void)bufferevent_setwatermark_impl_(bufev, events, lowmark, highmark, 0);
+}
+
+int
+bufferevent_setwatermark_checked(struct bufferevent *bufev, short events,
+    size_t lowmark, size_t highmark)
+{
+	return bufferevent_setwatermark_impl_(bufev, events, lowmark, highmark, 1);
 }
 
 int

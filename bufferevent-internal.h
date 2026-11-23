@@ -169,6 +169,17 @@ struct bufferevent_private {
 	/** Flag: set if we have deferred callbacks and a write callback is
 	 * pending. */
 	unsigned writecb_pending : 1;
+	/** Flag: set once a read callback has been forced to run because the
+	 * input buffer overran the read high watermark, and cleared as soon as
+	 * the input buffer drops back below that watermark.  It keeps an
+	 * overrunning read callback from being re-invoked in a loop. */
+	unsigned wm_read_overrun_notified : 1;
+
+	/** The input buffer length at the moment of the last forced read
+	 * callback.  A further forced callback is only scheduled if the buffer
+	 * has shrunk since then, which bounds the overrun handling by actual
+	 * progress made by the read callback. */
+	size_t wm_read_overrun_size;
 	/** Flag: set if we are currently busy connecting. */
 	unsigned connecting : 1;
 	/** Flag: set if a connect failed prematurely; this is a hack for
@@ -353,6 +364,15 @@ void bufferevent_unsuspend_write_(struct bufferevent *bufev, bufferevent_suspend
 	bufferevent_suspend_read_((b), BEV_SUSPEND_WM)
 #define bufferevent_wm_unsuspend_read(b) \
 	bufferevent_unsuspend_read_((b), BEV_SUSPEND_WM)
+
+/** Internal: Re-evaluate the read high watermark after the input buffer
+ * changed or after the watermark was reconfigured.  Suspends reading when the
+ * input buffer is at or above the high watermark and resumes it otherwise.
+ *
+ * Must be called with the bufferevent lock held.
+ */
+EVENT2_EXPORT_SYMBOL
+void bufferevent_wm_check_read_(struct bufferevent *bufev);
 
 /*
   Disable a bufferevent.  Equivalent to bufferevent_disable(), but

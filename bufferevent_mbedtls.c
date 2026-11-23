@@ -202,18 +202,22 @@ bio_bufferevent_write(void *ctx, const unsigned char *in, size_t inlen)
 	outlen = evbuffer_get_length(output);
 
 	/* Copy only as much data onto the output buffer as can fit under the
-	 * high-water mark. */
-	if (bufev->wm_write.high && bufev->wm_write.high <= (outlen + inlen)) {
-		if (bufev->wm_write.high <= outlen) {
+	 * high-water mark.  Compare in size_t so the bound is never bypassed by
+	 * an overflowing outlen + inlen sum. */
+	if (bufev->wm_write.high) {
+		size_t high = bufev->wm_write.high;
+		if (high <= outlen) {
 			/* If no data can fit, we'll need to retry later. */
 			return MBEDTLS_ERR_SSL_WANT_WRITE;
 		}
-		inlen = bufev->wm_write.high - outlen;
+		if (high - outlen < inlen)
+			inlen = high - outlen;
 	}
 
 	EVUTIL_ASSERT(inlen > 0);
-	evbuffer_add(output, in, inlen);
-	return inlen;
+	if (evbuffer_add(output, in, inlen) < 0)
+		return MBEDTLS_ERR_SSL_WANT_WRITE;
+	return (int)inlen;
 }
 
 static void

@@ -150,18 +150,30 @@ bio_bufferevent_write(BIO *b, const char *in, int inlen)
 	outlen = evbuffer_get_length(output);
 
 	/* Copy only as much data onto the output buffer as can fit under the
-	 * high-water mark. */
-	if (bufev->wm_write.high && bufev->wm_write.high <= (outlen + inlen)) {
-		if (bufev->wm_write.high <= outlen) {
+	 * high-water mark.  Compare in size_t so the bound is enforced even
+	 * when outlen + inlen would overflow size_t. */
+	if (bufev->wm_write.high) {
+		size_t high = bufev->wm_write.high;
+		if (inlen <= 0) {
+			/* Nothing to write; do not assert, just report it. */
+			BIO_set_retry_write(b);
+			return -1;
+		}
+		if (high <= outlen) {
 			/* If no data can fit, we'll need to retry later. */
 			BIO_set_retry_write(b);
 			return -1;
 		}
-		inlen = bufev->wm_write.high - outlen;
+		if (high - outlen <= (size_t)inlen) {
+			size_t room = high - outlen;
+			/* room > 0 here, so the cast is safe. */
+			inlen = (int)room;
+		}
 	}
 
 	EVUTIL_ASSERT(inlen > 0);
-	evbuffer_add(output, in, inlen);
+	if (evbuffer_add(output, in, (size_t)inlen) < 0)
+		return -1;
 	return inlen;
 }
 

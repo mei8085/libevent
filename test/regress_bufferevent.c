@@ -1445,6 +1445,228 @@ end:;
 	bufferevent_free(bev);
 }
 
+/* Boundary inputs to the watermark API must give a deterministic, safe
+ * result, and a rejected request must not disturb later ones. */
+static void
+test_bufferevent_watermark_bounds(void *arg)
+{
+	struct basic_test_data *data = arg;
+	struct bufferevent *bev = NULL;
+	size_t low, high;
+
+	bev = bufferevent_socket_new(data->base, -1, 0);
+	tt_assert(bev);
+
+	/* A read high watermark below the low watermark would suspend reading
+	 * below the level the read callback needs, deadlocking the bufferevent.
+	 * The legacy setter adjusts it so it can always make progress. */
+	bufferevent_setwatermark(bev, EV_READ, 50, 10);
+	bufferevent_getwatermark(bev, EV_READ, &low, &high);
+	tt_int_op(low, ==, 50);
+	tt_int_op(high, ==, 50);
+
+	/* The write high watermark is only an upper bound and is stored as is. */
+	bufferevent_setwatermark(bev, EV_WRITE, 100, 10);
+	bufferevent_getwatermark(bev, EV_WRITE, &low, &high);
+	tt_int_op(low, ==, 100);
+	tt_int_op(high, ==, 10);
+
+	/* The checked setter reports the inconsistent request and changes
+	 * nothing. */
+	errno = 0;
+	tt_int_op(bufferevent_setwatermark_checked(bev, EV_READ, 50, 10), ==, -1);
+	tt_int_op(errno, ==, EINVAL);
+	bufferevent_getwatermark(bev, EV_READ, &low, &high);
+	tt_int_op(low, ==, 50);
+	tt_int_op(high, ==, 50);
+
+	/* Empty or out-of-range event masks are rejected as well. */
+	errno = 0;
+	tt_int_op(bufferevent_setwatermark_checked(bev, 0, 0, 0), ==, -1);
+	tt_int_op(errno, ==, EINVAL);
+	errno = 0;
+	tt_int_op(bufferevent_setwatermark_checked(bev, EV_READ|EV_WRITE|0x100,
+	    0, 0), ==, -1);
+	tt_int_op(errno, ==, EINVAL);
+
+	/* A rejected call must not poison a later valid one. */
+	errno = 0;
+	tt_int_op(bufferevent_setwatermark_checked(bev, EV_READ, 30, 5), ==, -1);
+	tt_int_op(errno, ==, EINVAL);
+	tt_int_op(bufferevent_setwatermark_checked(bev, EV_READ, 5, 30), ==, 0);
+	bufferevent_getwatermark(bev, EV_READ, &low, &high);
+	tt_int_op(low, ==, 5);
+	tt_int_op(high, ==, 30);
+
+	/* Both read and write can be set in one call, and the normalized value
+	 * applies only to the read pair. */
+	tt_int_op(bufferevent_setwatermark_checked(bev, EV_READ|EV_WRITE,
+	    20, 10), ==, -1);
+	tt_int_op(bufferevent_setwatermark_checked(bev, EV_READ|EV_WRITE,
+	    10, 20), ==, 0);
+	bufferevent_getwatermark(bev, EV_READ, &low, &high);
+	tt_int_op(low, ==, 10);
+	tt_int_op(high, ==, 20);
+	bufferevent_getwatermark(bev, EV_WRITE, &low, &high);
+	tt_int_op(low, ==, 10);
+	tt_int_op(high, ==, 20);
+
+end:
+	if (bev)
+		bufferevent_free(bev);
+}
+
+static void
+wm_loop_stop_cb(evutil_socket_t fd, short what, void *arg)
+{
+	/* Just let the loop finish; the dispatch returns once the timeout is
+	 * the only pending event and fires. */
+}
+
+/* A read callback that never drains the input buffer must not be re-invoked
+ * forever when the buffer sits over the high watermark. */
+static int wm_no_drain_calls;
+static void
+wm_no_drain_readcb(struct bufferevent *bev, void *arg)
+{
+	/* Deliberately do not drain. */
+	++wm_no_drain_calls;
+	if (wm_no_drain_calls > 1000) {
+		TT_FAIL(("read callback re-invoked without progress"));
+		event_base_loopbreak(bufferevent_get_base(bev));
+	}
+}
+
+static void
+test_bufferevent_watermark_no_progress(void *arg)
+{
+	struct basic_test_data *data = arg;
+	struct bufferevent *pair[2];
+	struct timeval tv = { 0, 100000 };
+	struct event *tmo = NULL;
+	char buf[64];
+
+	memset(buf, 'x', sizeof(buf));
+	wm_no_drain_calls = 0;
+
+	tt_assert(bufferevent_pair_new(data->base, 0, pair) == 0);
+	bufferevent_setcb(pair[0], wm_no_drain_readcb, NULL, NULL, NULL);
+	bufferevent_enable(pair[0], EV_READ);
+	bufferevent_setwatermark(pair[0], EV_READ, 0, 16);
+	tt_assert(bufferevent_write(pair[1], buf, sizeof(buf)) == 0);
+
+	/* Run the loop long enough for any re-trigger loop to show up. */
+	tmo = event_new(data->base, -1, 0, wm_loop_stop_cb, NULL);
+	tt_assert(tmo);
+	event_add(tmo, &tv);
+	event_base_dispatch(data->base);
+
+	/* A handful of calls is fine; an unbounded loop is not. */
+	tt_int_op(wm_no_drain_calls, >, 0);
+	tt_int_op(wm_no_drain_calls, <=, 16);
+
+end:
+	if (tmo)
+		event_free(tmo);
+	if (pair[0])
+		bufferevent_free(pair[0]);
+	if (pair[1])
+		bufferevent_free(pair[1]);
+}
+
+/* A filter stopped by the underlying write high watermark must resume as soon
+ * as that buffer drains back below the high watermark -- not only when it hits
+ * the (possibly much lower) write low watermark. */
+static int wm_bp_passes;
+static enum bufferevent_filter_result
+wm_bp_pass_filter(struct evbuffer *src, struct evbuffer *dst, ev_ssize_t lim,
+    enum bufferevent_flush_mode state, void *ctx)
+{
+	size_t n = evbuffer_get_length(src);
+	if (!n)
+		return BEV_NEED_MORE;
+	if (lim == 0)
+		return BEV_NEED_MORE;
+	if (lim > 0 && (size_t)lim < n)
+		n = (size_t)lim;
+	++wm_bp_passes;
+	evbuffer_remove_buffer(src, dst, n);
+	return BEV_OK;
+}
+
+static void
+wm_bp_enable_reader_cb(evutil_socket_t fd, short what, void *arg)
+{
+	struct bufferevent *peer = arg;
+	/* Let the pair partner move data; its read high watermark caps the
+	 * transfer, leaving the underlying output below its write high
+	 * watermark but above its low watermark. */
+	bufferevent_enable(peer, EV_READ);
+	event_base_loopexit(bufferevent_get_base(peer), NULL);
+}
+
+static void
+test_bufferevent_filter_write_backpressure(void *arg)
+{
+	struct basic_test_data *data = arg;
+	struct bufferevent *pair[2] = { NULL, NULL };
+	struct bufferevent *filter = NULL;
+	struct event *tmo = NULL;
+	struct timeval tv = { 0, 20000 };
+	char buf[100000];
+
+	wm_bp_passes = 0;
+	memset(buf, 'x', sizeof(buf));
+
+	tt_assert(bufferevent_pair_new(data->base, 0, pair) == 0);
+	/* The peer does not read yet, so the underlying output fills up. */
+	bufferevent_disable(pair[1], EV_READ);
+	bufferevent_setwatermark(pair[1], EV_READ, 0, 1500);
+
+	filter = bufferevent_filter_new(pair[0], NULL, wm_bp_pass_filter,
+	    0, NULL, NULL);
+	tt_assert(filter);
+
+	bufferevent_enable(pair[0], EV_WRITE);
+	bufferevent_enable(filter, EV_WRITE);
+	/* Stop the filter once the underlying output reaches 4000 bytes. */
+	bufferevent_setwatermark(pair[0], EV_WRITE, 0, 4000);
+
+	tt_assert(bufferevent_write(filter, buf, sizeof(buf)) == 0);
+
+	/* Underlying output is full; the filter is stalled. */
+	tt_int_op(evbuffer_get_length(bufferevent_get_output(pair[0])), >=, 4000);
+
+	tmo = event_new(data->base, -1, 0, wm_bp_enable_reader_cb, pair[1]);
+	tt_assert(tmo);
+	event_add(tmo, &tv);
+
+	/* Once the peer reads 1500 bytes the underlying output drops to 2500,
+	 * below its high watermark.  The filter must resume; with the old
+	 * behaviour it stayed stalled until the buffer was fully drained. */
+	while (wm_bp_passes == 1 && event_base_loop(data->base, EVLOOP_ONCE) == 0)
+		;
+
+	tt_int_op(wm_bp_passes, >, 1);
+	/* The underlying output is refilled from the filter's backlog. */
+	tt_int_op(evbuffer_get_length(bufferevent_get_output(pair[0])), >, 2500);
+	tt_int_op(evbuffer_get_length(bufferevent_get_output(filter)), <,
+	    sizeof(buf));
+
+end:
+	if (tmo)
+		event_free(tmo);
+	/* The filter does not own the underlying (no BEV_OPT_CLOSE_ON_FREE),
+	 * so free all three here.  Freeing the filter first releases the
+	 * reference it holds on pair[0]. */
+	if (filter)
+		bufferevent_free(filter);
+	if (pair[0])
+		bufferevent_free(pair[0]);
+	if (pair[1])
+		bufferevent_free(pair[1]);
+}
+
 struct testcase_t bufferevent_testcases[] = {
 
 	LEGACY(bufferevent, TT_ISOLATED),
@@ -1526,6 +1748,15 @@ struct testcase_t bufferevent_testcases[] = {
 
 	LEGACY(bufferevent_ratelimit_div_by_zero, TT_ISOLATED),
 	LEGACY(bufferevent_ratelimit_overflow, TT_ISOLATED),
+
+	{ "bufferevent_watermark_bounds", test_bufferevent_watermark_bounds,
+	  TT_FORK|TT_NEED_BASE, &basic_setup, NULL },
+	{ "bufferevent_watermark_no_progress",
+	  test_bufferevent_watermark_no_progress,
+	  TT_FORK|TT_NEED_BASE|TT_RETRIABLE, &basic_setup, NULL },
+	{ "bufferevent_filter_write_backpressure",
+	  test_bufferevent_filter_write_backpressure,
+	  TT_FORK|TT_NEED_BASE|TT_RETRIABLE, &basic_setup, NULL },
 
 	END_OF_TESTCASES,
 };

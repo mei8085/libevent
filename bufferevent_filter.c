@@ -77,6 +77,9 @@ static void bufferevent_filtered_inbuf_cb(struct evbuffer *buf,
 static void bufferevent_filtered_outbuf_cb(struct evbuffer *buf,
     const struct evbuffer_cb_info *info, void *arg);
 
+static void bufferevent_filtered_underlying_outbuf_cb(struct evbuffer *buf,
+    const struct evbuffer_cb_info *info, void *arg);
+
 struct bufferevent_filtered {
 	struct bufferevent_private bev;
 
@@ -86,6 +89,11 @@ struct bufferevent_filtered {
 	struct evbuffer_cb_entry *inbuf_cb;
 	/** A callback on our outbuf to notice when somebody adds data */
 	struct evbuffer_cb_entry *outbuf_cb;
+	/** A callback on the underlying outbuf to notice when it drains.  This
+	 * is what re-opens the filter as soon as the underlying buffer is back
+	 * below its write high watermark, instead of waiting for the
+	 * underlying write callback (which only fires at the low watermark). */
+	struct evbuffer_cb_entry *underlying_outbuf_cb;
 	/** True iff we have received an EOF callback from the underlying
 	 * bufferevent. */
 	unsigned got_eof;
@@ -193,11 +201,17 @@ bufferevent_filter_new(struct bufferevent *underlying,
 		mm_free(bufev_f);
 		return NULL;
 	}
+
+	/* Set the underlying before enabling locking, so that a thread-safe
+	 * filter adopts its underlying's lock (like bufferevent_ssl does).  That
+	 * makes the filter and the underlying share a single (recursive) lock,
+	 * which is what keeps the evbuffer callbacks that hop between the
+	 * underlying output buffer and the filter from inverting lock order. */
+	bufev_f->underlying = underlying;
+
 	if (options & BEV_OPT_THREADSAFE) {
 		bufferevent_enable_locking_(downcast(bufev_f), NULL);
 	}
-
-	bufev_f->underlying = underlying;
 
 	bufev_f->process_in = input_filter;
 	bufev_f->process_out = output_filter;
@@ -215,6 +229,14 @@ bufferevent_filter_new(struct bufferevent *underlying,
 	bufev_f->outbuf_cb = evbuffer_add_cb(downcast(bufev_f)->output,
 	   bufferevent_filtered_outbuf_cb, bufev_f);
 
+	/* Watch the underlying output buffer so the filter is re-opened as soon
+	 * as that buffer drains back below its write high watermark.  Relying on
+	 * the underlying write callback alone is not enough: it only fires when
+	 * the buffer reaches its *low* watermark, which can be far below the
+	 * high watermark the filter stopped at, leaving the filter stalled. */
+	bufev_f->underlying_outbuf_cb = evbuffer_add_cb(underlying->output,
+	    bufferevent_filtered_underlying_outbuf_cb, bufev_f);
+
 	bufferevent_init_generic_timeout_cbs_(downcast(bufev_f));
 	bufferevent_incref_(underlying);
 
@@ -228,6 +250,14 @@ static void
 be_filter_unlink(struct bufferevent *bev)
 {
 	struct bufferevent_filtered *bevf = upcast(bev);
+
+	/* Detach from the underlying output buffer while the underlying is
+	 * still guaranteed to be alive (it may be freed just below). */
+	if (bevf->underlying_outbuf_cb) {
+		evbuffer_remove_cb_entry(bevf->underlying->output,
+		    bevf->underlying_outbuf_cb);
+		bevf->underlying_outbuf_cb = NULL;
+	}
 	if (bevf->bev.options & BEV_OPT_CLOSE_ON_FREE) {
 		/* Yes, there is also a decref in bufferevent_decref_.
 		 * That decref corresponds to the incref when we set
@@ -410,6 +440,45 @@ be_filter_process_output(struct bufferevent_filtered *bevf,
 		BEV_RESET_GENERIC_WRITE_TIMEOUT(bufev);
 
 	return res;
+}
+
+/* Called when the underlying output buffer shrinks.  When the filter stopped
+ * because that buffer was full, a drain back below the high watermark re-opens
+ * it.  This is what makes the write high watermark a real back-pressure limit
+ * rather than a permanent stall: the underlying write callback alone only
+ * fires at the *low* watermark, which may be far below the high watermark. */
+static void
+bufferevent_filtered_underlying_outbuf_cb(struct evbuffer *buf,
+    const struct evbuffer_cb_info *cbinfo, void *arg)
+{
+	struct bufferevent_filtered *bevf = arg;
+	struct bufferevent *bev = downcast(bevf);
+	struct bufferevent_private *bufev_private = BEV_UPCAST(bev);
+	int processed_any = 0;
+
+	/* Additions cannot unblock us; only a drain can. */
+	if (!cbinfo->n_deleted)
+		return;
+	/* Without a write high watermark the underlying write callback already
+	 * wakes us early enough; do not add a second wake-up path. */
+	if (!bevf->underlying->wm_write.high)
+		return;
+
+	BEV_LOCK(bev);
+	/* Another thread may have started freeing the filter while we waited
+	 * for the lock.  Take our own reference before calling into the output
+	 * path, which may run a user write callback that frees the filter. */
+	EVUTIL_ASSERT(bufev_private->refcnt >= 0);
+	if (bufev_private->refcnt > 0 &&
+	    (bev->enabled & EV_WRITE) &&
+	    evbuffer_get_length(bev->output) &&
+	    !be_underlying_writebuf_full(bevf, BEV_NORMAL)) {
+		++bufev_private->refcnt;
+		be_filter_process_output(bevf, BEV_NORMAL, &processed_any);
+		bufferevent_decref_and_unlock_(bev);
+		return;
+	}
+	BEV_UNLOCK(bev);
 }
 
 /* Called when the size of our outbuf changes. */
