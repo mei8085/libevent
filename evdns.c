@@ -1264,7 +1264,7 @@ name_parse(u8 *packet, int length, int *idx, char *name_out, int name_out_len) {
 
 /* parses a raw request from a nameserver */
 static int
-reply_parse(struct evdns_base *base, u8 *packet, int length)
+reply_parse(struct evdns_base *base, struct nameserver *ns, u8 *packet, int length)
 {
 	int j = 0, k = 0;  /* index into packet */
 	u16 t_;	 /* used by the macros */
@@ -1298,11 +1298,17 @@ reply_parse(struct evdns_base *base, u8 *packet, int length)
 
 	/* If it's not an answer, it doesn't correspond to any request. */
 	if (!(flags & _QR_MASK)) return -1;  /* must be an answer */
-	if ((flags & (_RCODE_MASK|_TC_MASK)) && (flags & (_RCODE_MASK|_TC_MASK)) != DNS_ERR_NOTEXIST) {
-		/* there was an error and it's not NXDOMAIN */
-		goto err;
+
+	/* A response only belongs to this request if it arrived on the
+	 * socket of the nameserver to which the (possibly retransmitted)
+	 * query was last sent.  A late reply from a server we already
+	 * rotated away from must not be matched to the current request,
+	 * since its transaction id may have been reused. */
+	if (req->ns != ns) {
+		log(EVDNS_LOG_WARN, "Dropping DNS response for transaction "
+		    "%u from an unexpected nameserver.", trans_id);
+		return -1;
 	}
-	/* if (!answers) return; */  /* must have an answer of some form */
 
 	/* This macro skips a name in the DNS reply. */
 #define SKIP_NAME						\
@@ -1314,11 +1320,20 @@ reply_parse(struct evdns_base *base, u8 *packet, int length)
 
 	reply.type = req->request_type;
 
-	/* skip over each question in the reply */
+	/* Validate the question section before anything else, so that
+	 * error responses are subjected to the same ownership check as
+	 * successful ones.  Matching only on the transaction id is not
+	 * enough: ids are 16 bits and get reused once a request finishes,
+	 * so a late answer to an earlier query (search domain expansion,
+	 * server rotation or a canceled/reissued request) can collide with
+	 * a live request.  The question name, type and class together with
+	 * the receiving nameserver uniquely identify the query this packet
+	 * answers. */
 	for (i = 0; i < questions; ++i) {
 		/* the question looks like
 		 *   <label:name><u16:type><u16:class>
 		 */
+		u16 qtype, qclass;
 		tmp_name[0] = '\0';
 		cmp_name[0] = '\0';
 		k = j;
@@ -1328,20 +1343,30 @@ reply_parse(struct evdns_base *base, u8 *packet, int length)
 			cmp_name, sizeof(cmp_name))<0)
 			goto err;
 		if (!base->global_randomize_case) {
-			if (strcmp(tmp_name, cmp_name) == 0)
-				name_matches = 1;
+			if (strcmp(tmp_name, cmp_name) != 0)
+				goto drop_mismatch;
 		} else {
-			if (evutil_ascii_strcasecmp(tmp_name, cmp_name) == 0)
-				name_matches = 1;
+			if (evutil_ascii_strcasecmp(tmp_name, cmp_name) != 0)
+				goto drop_mismatch;
 		}
-
-		j += 4;
+		/* The question type and class must be the ones we sent. */
+		GET16(qtype);
+		GET16(qclass);
+		if (qtype != req->request_type || qclass != CLASS_INET)
+			goto drop_mismatch;
 		if (j > length)
 			goto err;
+		name_matches = 1;
 	}
 
 	if (!name_matches)
 		goto err;
+
+	if ((flags & (_RCODE_MASK|_TC_MASK)) && (flags & (_RCODE_MASK|_TC_MASK)) != DNS_ERR_NOTEXIST) {
+		/* there was an error and it's not NXDOMAIN */
+		goto err;
+	}
+	/* if (!answers) return; */  /* must have an answer of some form */
 
 	/* We can allocate less for the reply data, but to do it we'll have
 	 * to parse the response. To simplify things let's just allocate
@@ -1459,6 +1484,19 @@ reply_parse(struct evdns_base *base, u8 *packet, int length)
 	if (reply.data.raw)
 		mm_free(reply.data.raw);
 	return 0;
+ drop_mismatch:
+	/* The packet's question section does not match the query we have
+	 * on record for this transaction id (different name, type or
+	 * class), so it is an answer to a different, older query whose id
+	 * has been reused.  Drop it silently: the current request keeps
+	 * waiting for its own answer and must neither fail nor cache the
+	 * mismatched data. */
+	log(EVDNS_LOG_WARN, "Dropping DNS response for transaction %u "
+	    "whose question section does not match the outstanding query.",
+	    trans_id);
+	if (reply.data.raw)
+		mm_free(reply.data.raw);
+	return -1;
  err:
 	if (req)
 		reply_handle(req, flags, 0, NULL);
@@ -1697,7 +1735,7 @@ nameserver_read(struct nameserver *ns) {
 		}
 
 		ns->timedout = 0;
-		reply_parse(ns->base, packet, r);
+		reply_parse(ns->base, ns, packet, r);
 	}
 done:
 	mm_free(packet);
@@ -2873,7 +2911,7 @@ client_tcp_read_packet_cb(struct bufferevent *bev, void *ctx)
 		if (!msg)
 			break;
 
-		reply_parse(server->base, msg, msg_len);
+		reply_parse(server->base, server, msg, msg_len);
 		mm_free(msg);
 		msg = NULL;
 		if (server->connection == NULL) {

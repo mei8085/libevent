@@ -56,6 +56,13 @@ Security fixes, also in 2.1.13 (example code):
    been disabled by mistake.
  - Fix compilation of some examples and tests,
    and resolve several compiler warnings.
+ - In evdns, only accept a response when its question
+   name, type and class and the nameserver it arrived
+   from match the query on record for the transaction
+   id.  Previously a late answer to an earlier query,
+   whose id had been reused after search domain
+   expansion, server rotation or cancellation, could
+   be delivered to (and cached for) the wrong request.
 
 
 

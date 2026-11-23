@@ -3348,6 +3348,401 @@ end:
 		evutil_closesocket(udp_sock);
 }
 
+/* === Tests for matching DNS responses to the outstanding query.
+ *
+ * A response may only be attributed to a request when its question
+ * section (name, type and class) and the nameserver it arrived from
+ * match the query currently on record for the transaction id.  The
+ * helpers below implement a minimal raw UDP DNS server so that replies
+ * with deliberately mismatched contents can be injected. */
+
+/* Parse the (single) question of a DNS query packet.  Returns 0 on
+ * success and fills in *trans_id, *qtype and qname. */
+static int
+dns_test_parse_query(const u_char *pkt, int len, ev_uint16_t *trans_id,
+    ev_uint16_t *qtype, char *qname, size_t qname_len)
+{
+	int j = 12; /* skip the 12 byte header */
+	size_t out = 0;
+
+	if (len < 17)
+		return -1;
+	memcpy(trans_id, pkt, 2);
+	*trans_id = ntohs(*trans_id);
+
+	for (;;) {
+		unsigned char lablen;
+		if (j >= len)
+			return -1;
+		lablen = pkt[j++];
+		if (lablen == 0)
+			break;
+		if (lablen & 0xc0)
+			return -1;
+		if (j + lablen > len || out + lablen + 1 >= qname_len)
+			return -1;
+		if (out)
+			qname[out++] = '.';
+		memcpy(qname + out, pkt + j, lablen);
+		out += lablen;
+		j += lablen;
+	}
+	qname[out] = '\0';
+	if (j + 4 > len)
+		return -1;
+	memcpy(qtype, pkt + j, 2);
+	*qtype = ntohs(*qtype);
+	return 0;
+}
+
+/* Append a DNS-encoded name (labels) to buf at *off.  Returns -1 if the
+ * name does not fit. */
+static int
+dns_test_append_name(u_char *buf, size_t buf_len, int *off, const char *name)
+{
+	const char *p = name;
+	int o = *off;
+
+	while (*p) {
+		const char *dot = strchr(p, '.');
+		size_t lab = dot ? (size_t)(dot - p) : strlen(p);
+		if (lab == 0 || lab >= 64 ||
+		    o + (int)lab + 1 >= (int)buf_len)
+			return -1;
+		buf[o++] = (u_char)lab;
+		memcpy(buf + o, p, lab);
+		o += (int)lab;
+		p += lab;
+		if (dot)
+			p++; /* skip '.' */
+	}
+	if (o + 1 >= (int)buf_len)
+		return -1;
+	buf[o++] = 0;
+	*off = o;
+	return 0;
+}
+
+/* Build a DNS response packet.  The question section is built from
+ * qname/qtype; when rdata is non-NULL an answer RR of qtype is added.
+ * Returns the packet length, or -1 on error. */
+static int
+dns_test_build_reply(u_char *buf, size_t buf_len, ev_uint16_t trans_id,
+    ev_uint16_t flags, const char *qname, ev_uint16_t qtype, ev_uint32_t ttl,
+    const u_char *rdata, ev_uint16_t rdlen)
+{
+	int off = 0;
+	ev_uint16_t u16;
+	ev_uint32_t u32;
+
+	if (buf_len < 512)
+		return -1;
+	/* header */
+	u16 = htons(trans_id); memcpy(buf + off, &u16, 2); off += 2;
+	u16 = htons(flags);    memcpy(buf + off, &u16, 2); off += 2;
+	u16 = htons(1);        memcpy(buf + off, &u16, 2); off += 2; /* qdcount */
+	u16 = htons(rdata ? 1 : 0);
+	memcpy(buf + off, &u16, 2); off += 2; /* ancount */
+	u16 = 0; memcpy(buf + off, &u16, 2); off += 2;
+	u16 = 0; memcpy(buf + off, &u16, 2); off += 2;
+	/* question */
+	if (dns_test_append_name(buf, buf_len, &off, qname) < 0)
+		return -1;
+	u16 = htons(qtype); memcpy(buf + off, &u16, 2); off += 2;
+	u16 = htons(EVDNS_CLASS_INET); memcpy(buf + off, &u16, 2); off += 2;
+
+	if (rdata) {
+		/* answer RR: compression pointer to the question name at 12 */
+		u16 = htons(0xc00c); memcpy(buf + off, &u16, 2); off += 2;
+		u16 = htons(qtype); memcpy(buf + off, &u16, 2); off += 2;
+		u16 = htons(EVDNS_CLASS_INET);
+		memcpy(buf + off, &u16, 2); off += 2;
+		u32 = htonl(ttl); memcpy(buf + off, &u32, 4); off += 4;
+		u16 = htons(rdlen); memcpy(buf + off, &u16, 2); off += 2;
+		memcpy(buf + off, rdata, rdlen); off += rdlen;
+	}
+	return off;
+}
+
+/* Fake server state for the question-section mismatch test. */
+struct dns_mismatch_server {
+	struct event read_ev;
+	evutil_socket_t fd;
+	int n_queries;
+};
+
+static void
+dns_mismatch_server_read_cb(evutil_socket_t fd, short what, void *arg)
+{
+	struct dns_mismatch_server *srv = arg;
+	u_char pkt[512], reply[512];
+	char qname[256];
+	ev_uint16_t trans_id = 0, qtype = 0;
+	ev_uint32_t addr;
+	int r, reply_len;
+	(void)what;
+
+	for (;;) {
+		struct sockaddr_storage ss;
+		ev_socklen_t sslen = sizeof(ss);
+		r = recvfrom(fd, pkt, sizeof(pkt), 0,
+		    (struct sockaddr *)&ss, &sslen);
+		if (r < 0) {
+			if (EVUTIL_ERR_RW_RETRIABLE(evutil_socket_geterror(fd)))
+				break;
+			return;
+		}
+		if (dns_test_parse_query(pkt, r, &trans_id, &qtype,
+			qname, sizeof(qname)) < 0)
+			return;
+
+		srv->n_queries++;
+
+		/* 1. Reuse the correct transaction id but answer a
+		 *    different question name.  Must be dropped. */
+		reply_len = dns_test_build_reply(reply, sizeof(reply),
+		    trans_id, 0x8180, "wrong-question.example.com",
+		    EVDNS_TYPE_A, 30, (const u_char *)"\x01\x02\x03\x04", 4);
+		if (reply_len < 0)
+			return;
+		sendto(fd, reply, reply_len, 0,
+		    (struct sockaddr *)&ss, sslen);
+
+		/* 2. Same name but a different question type.  Must be
+		 *    dropped as well. */
+		{
+			const u_char aaaa[16] =
+			    {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1};
+			reply_len = dns_test_build_reply(reply, sizeof(reply),
+			    trans_id, 0x8180, qname, EVDNS_TYPE_AAAA, 30,
+			    aaaa, sizeof(aaaa));
+			if (reply_len < 0)
+				return;
+			sendto(fd, reply, reply_len, 0,
+			    (struct sockaddr *)&ss, sslen);
+		}
+
+		/* 3. The genuine answer to the actual question, which the
+		 *    client must still accept. */
+		addr = htonl(0x50506060U); /* 80.80.96.96 */
+		reply_len = dns_test_build_reply(reply, sizeof(reply),
+		    trans_id, 0x8180, qname, qtype, 60,
+		    (const u_char *)&addr, 4);
+		if (reply_len < 0)
+			return;
+		sendto(fd, reply, reply_len, 0,
+		    (struct sockaddr *)&ss, sslen);
+	}
+}
+
+static void
+dns_reply_question_mismatch_test(void *arg)
+{
+	struct basic_test_data *data = arg;
+	struct event_base *base = data->base;
+	struct evdns_base *dns = NULL;
+	struct dns_mismatch_server srv;
+	struct sockaddr_in sin;
+	struct sockaddr_storage ss;
+	ev_socklen_t slen;
+	struct generic_dns_callback_result res;
+	char nbuf[64];
+
+	memset(&srv, 0, sizeof(srv));
+	srv.fd = -1;
+	srv.fd = socket(AF_INET, SOCK_DGRAM, 0);
+	tt_assert(srv.fd >= 0);
+	evutil_make_socket_nonblocking(srv.fd);
+	memset(&sin, 0, sizeof(sin));
+	sin.sin_family = AF_INET;
+	sin.sin_port = 0;
+	sin.sin_addr.s_addr = htonl(0x7f000001UL);
+	tt_assert(!bind(srv.fd, (struct sockaddr *)&sin, sizeof(sin)));
+
+	memset(&ss, 0, sizeof(ss));
+	slen = sizeof(ss);
+	tt_assert(!getsockname(srv.fd, (struct sockaddr *)&ss, &slen));
+
+	event_assign(&srv.read_ev, base, srv.fd, EV_READ | EV_PERSIST,
+	    dns_mismatch_server_read_cb, &srv);
+	tt_assert(!event_add(&srv.read_ev, NULL));
+
+	dns = evdns_base_new(base, 0);
+	tt_assert(dns);
+	evutil_snprintf(nbuf, sizeof(nbuf), "127.0.0.1:%d",
+	    (int)ntohs(((struct sockaddr_in *)&ss)->sin_port));
+	tt_assert(!evdns_base_nameserver_ip_add(dns, nbuf));
+	/* The 0x20 case randomization must not weaken the name check. */
+	tt_assert(!evdns_base_set_option(dns, "randomize-case:", "0"));
+
+	memset(&res, 0, sizeof(res));
+	evdns_base_resolve_ipv4(dns, "real-question.example.com",
+	    DNS_QUERY_NO_SEARCH, generic_dns_callback, &res);
+
+	n_replies_left = 1;
+	exit_base = base;
+	event_base_dispatch(base);
+
+	tt_int_op(res.result, ==, DNS_ERR_NONE);
+	tt_int_op(res.type, ==, DNS_IPv4_A);
+	tt_int_op(res.count, ==, 1);
+	tt_int_op(((ev_uint32_t *)res.addrs)[0], ==, htonl(0x50506060U));
+	tt_int_op(srv.n_queries, ==, 1);
+
+end:
+	if (dns)
+		evdns_base_free(dns, 0);
+	if (srv.fd >= 0) {
+		event_del(&srv.read_ev);
+		evutil_closesocket(srv.fd);
+	}
+}
+
+/* Fake server for the nameserver-ownership test.  The primary server
+ * answers NOTIMPL once (triggering a reissue to the secondary server)
+ * and then, when the query is reissued, also sends a spoofed answer
+ * carrying the same transaction id. */
+struct dns_ns_server {
+	struct event read_ev;
+	evutil_socket_t fd;
+	int mode; /* 0 = primary (NOTIMPL + spoof), 1 = secondary */
+};
+
+static void
+dns_ns_server_read_cb(evutil_socket_t fd, short what, void *arg)
+{
+	struct dns_ns_server *srv = arg;
+	u_char pkt[512], reply[512];
+	char qname[256];
+	ev_uint16_t trans_id = 0, qtype = 0;
+	ev_uint32_t addr;
+	int r, reply_len;
+	(void)what;
+
+	for (;;) {
+		struct sockaddr_storage ss;
+		ev_socklen_t sslen = sizeof(ss);
+		r = recvfrom(fd, pkt, sizeof(pkt), 0,
+		    (struct sockaddr *)&ss, &sslen);
+		if (r < 0) {
+			if (EVUTIL_ERR_RW_RETRIABLE(evutil_socket_geterror(fd)))
+				break;
+			return;
+		}
+		if (dns_test_parse_query(pkt, r, &trans_id, &qtype,
+			qname, sizeof(qname)) < 0)
+			return;
+
+		if (srv->mode == 0) {
+			/* NOTIMPL: the client reissues to the other
+			 * nameserver. */
+			reply_len = dns_test_build_reply(reply, sizeof(reply),
+			    trans_id, 0x8180 | 4 /* rcode NOTIMPL */,
+			    qname, qtype, 0, NULL, 0);
+			if (reply_len < 0)
+				return;
+			sendto(fd, reply, reply_len, 0,
+			    (struct sockaddr *)&ss, sslen);
+			/* Late, spoofed answer from the discarded server,
+			 * reusing the same transaction id.  Must be
+			 * ignored: the request now belongs to the other
+			 * server. */
+			addr = htonl(0x0a0a0a0aU); /* 10.10.10.10 */
+			reply_len = dns_test_build_reply(reply, sizeof(reply),
+			    trans_id, 0x8180, qname, qtype, 30,
+			    (const u_char *)&addr, 4);
+			if (reply_len < 0)
+				return;
+			sendto(fd, reply, reply_len, 0,
+			    (struct sockaddr *)&ss, sslen);
+		} else {
+			/* The genuine answer from the current server. */
+			addr = htonl(0xac100101U); /* 172.16.1.1 */
+			reply_len = dns_test_build_reply(reply, sizeof(reply),
+			    trans_id, 0x8180, qname, qtype, 60,
+			    (const u_char *)&addr, 4);
+			if (reply_len < 0)
+				return;
+			sendto(fd, reply, reply_len, 0,
+			    (struct sockaddr *)&ss, sslen);
+		}
+	}
+}
+
+static void
+dns_reply_nameserver_ownership_test(void *arg)
+{
+	struct basic_test_data *data = arg;
+	struct event_base *base = data->base;
+	struct evdns_base *dns = NULL;
+	struct dns_ns_server srv[2];
+	struct sockaddr_in sin;
+	struct sockaddr_storage ss;
+	ev_socklen_t slen;
+	struct generic_dns_callback_result res;
+	char nbuf[64];
+	int i;
+
+	memset(srv, 0, sizeof(srv));
+	for (i = 0; i < 2; ++i) {
+		srv[i].fd = -1;
+		srv[i].fd = socket(AF_INET, SOCK_DGRAM, 0);
+		tt_assert(srv[i].fd >= 0);
+		srv[i].mode = i;
+		evutil_make_socket_nonblocking(srv[i].fd);
+		memset(&sin, 0, sizeof(sin));
+		sin.sin_family = AF_INET;
+		sin.sin_port = 0;
+		sin.sin_addr.s_addr = htonl(0x7f000001UL);
+		tt_assert(!bind(srv[i].fd, (struct sockaddr *)&sin,
+		    sizeof(sin)));
+		event_assign(&srv[i].read_ev, base, srv[i].fd,
+		    EV_READ | EV_PERSIST, dns_ns_server_read_cb, &srv[i]);
+		tt_assert(!event_add(&srv[i].read_ev, NULL));
+	}
+
+	dns = evdns_base_new(base, 0);
+	tt_assert(dns);
+	for (i = 0; i < 2; ++i) {
+		memset(&ss, 0, sizeof(ss));
+		slen = sizeof(ss);
+		tt_assert(!getsockname(srv[i].fd,
+		    (struct sockaddr *)&ss, &slen));
+		evutil_snprintf(nbuf, sizeof(nbuf), "127.0.0.1:%d",
+		    (int)ntohs(((struct sockaddr_in *)&ss)->sin_port));
+		tt_assert(!evdns_base_nameserver_ip_add(dns, nbuf));
+	}
+	tt_assert(!evdns_base_set_option(dns, "randomize-case:", "0"));
+	/* A reissue only marks the request for retransmission; it is
+	 * actually resent from the request timeout, so keep it short. */
+	tt_assert(!evdns_base_set_option(dns, "timeout:", "0.2"));
+	tt_assert(!evdns_base_set_option(dns, "attempts:", "5"));
+
+	memset(&res, 0, sizeof(res));
+	evdns_base_resolve_ipv4(dns, "rotated.example.com",
+	    DNS_QUERY_NO_SEARCH, generic_dns_callback, &res);
+
+	n_replies_left = 1;
+	exit_base = base;
+	event_base_dispatch(base);
+
+	tt_int_op(res.result, ==, DNS_ERR_NONE);
+	tt_int_op(res.type, ==, DNS_IPv4_A);
+	tt_int_op(res.count, ==, 1);
+	/* The spoofed 10.10.10.10 answer must never be delivered. */
+	tt_int_op(((ev_uint32_t *)res.addrs)[0], ==, htonl(0xac100101U));
+
+end:
+	if (dns)
+		evdns_base_free(dns, 0);
+	for (i = 0; i < 2; ++i) {
+		if (srv[i].fd >= 0) {
+			event_del(&srv[i].read_ev);
+			evutil_closesocket(srv[i].fd);
+		}
+	}
+}
+
 #define DNS_LEGACY(name, flags)					       \
 	{ #name, run_legacy_test_fn, flags|TT_LEGACY, &legacy_setup,   \
 		    dns_##name }
@@ -3452,6 +3847,11 @@ struct testcase_t dns_testcases[] = {
 	  TT_FORK|TT_NEED_BASE|TT_NO_LOGS, &basic_setup, NULL },
 	{ "edns", test_edns,
 	  TT_FORK|TT_NEED_BASE, &basic_setup, NULL },
+
+	{ "reply_question_mismatch", dns_reply_question_mismatch_test,
+	  TT_FORK|TT_NEED_BASE|TT_NO_LOGS, &basic_setup, NULL },
+	{ "reply_nameserver_ownership", dns_reply_nameserver_ownership_test,
+	  TT_FORK|TT_NEED_BASE|TT_NO_LOGS|TT_RETRIABLE, &basic_setup, NULL },
 
 	END_OF_TESTCASES
 };
