@@ -77,6 +77,21 @@
 #define bufferevent_ssl_socket_new bufferevent_mbedtls_socket_new
 #define bufferevent_ssl_filter_new bufferevent_mbedtls_filter_new
 
+/* Helpers used by the TLS callback-ordering/ownership regression tests.
+ * The function definitions live below the regress_ssl.c include because they
+ * call bufferevent_mbedtls_dyncontext_new(), which the public
+ * bufferevent_ssl.h header only declares once EVENT__HAVE_MBEDTLS is set. */
+#define SSL_TEST_BACKEND_NAME "mbedtls"
+#define ssl_test_get_error(bev) bufferevent_get_mbedtls_error((bev))
+#define ssl_test_verify_fail_conf_t mbedtls_ssl_config
+
+static mbedtls_ssl_config *
+ssl_test_new_verify_fail_client_conf(void);
+static void
+ssl_test_verify_fail_client_conf_free(mbedtls_ssl_config *conf);
+static SSL *
+ssl_test_new_verify_fail_client_ssl(mbedtls_ssl_config *conf);
+
 struct rwcount;
 static void BIO_setup(SSL *ssl, struct rwcount *rw);
 static void *mbedtls_test_setup(const struct testcase_t *testcase);
@@ -86,6 +101,25 @@ const struct testcase_setup_t mbedtls_setup = {
 #define SSL_SET_HOSTNAME(ssl) mbedtls_ssl_set_hostname((ssl), "example.com")
 #define ssl_setup mbedtls_setup
 #include "regress_ssl.c"
+
+static void
+ssl_test_verify_fail_client_conf_free(mbedtls_ssl_config *conf)
+{
+	if (!conf)
+		return;
+	mbedtls_ssl_config_free(conf);
+	free(conf);
+}
+
+/* Create a client SSL that demands a verified peer certificate but has no
+ * trust store, so the handshake must fail with a verification error.  The
+ * expected hostname is set by the shared caller via SSL_SET_HOSTNAME(), since
+ * Mbed TLS 4 refuses to verify without one. */
+static SSL *
+ssl_test_new_verify_fail_client_ssl(mbedtls_ssl_config *conf)
+{
+	return bufferevent_mbedtls_dyncontext_new(conf);
+}
 static mbedtls_ssl_config *the_mbedtls_conf[2] = {NULL, NULL};
 #if MBEDTLS_VERSION_MAJOR < 4
 static mbedtls_entropy_context entropy;
@@ -120,6 +154,37 @@ mbedtls_rng(void* ctx, unsigned char* buffer, size_t len)
 	return 0;
 }
 #endif
+
+/* A client SSL config that demands a verified peer certificate but has no
+ * CA chain, so the handshake must fail with a verification error.  The
+ * config must outlive every SSL built from it (mbedtls_ssl_setup() keeps a
+ * pointer rather than copying it), so callers pair it with
+ * ssl_test_verify_fail_client_conf_free(). */
+static mbedtls_ssl_config *
+ssl_test_new_verify_fail_client_conf(void)
+{
+	mbedtls_ssl_config *conf = malloc(sizeof(mbedtls_ssl_config));
+	tt_assert(conf);
+	mbedtls_ssl_config_init(conf);
+	tt_assert(!mbedtls_ssl_config_defaults(conf, MBEDTLS_SSL_IS_CLIENT,
+		MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT));
+#if MBEDTLS_VERSION_MAJOR < 4
+	/* Mirror the standard client config's RNG so the handshake actually
+	 * proceeds far enough to validate the certificate.  Mbed TLS 4 uses
+	 * PSA Crypto and needs no explicit RNG callback. */
+	mbedtls_ssl_conf_rng(conf, mbedtls_ctr_drbg_random, &ctr_drbg);
+#endif
+	/* Require verification but deliberately install no CA chain: the
+	 * self-signed server certificate cannot verify. */
+	mbedtls_ssl_conf_authmode(conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+	return conf;
+end:
+	if (conf) {
+		mbedtls_ssl_config_free(conf);
+		free(conf);
+	}
+	return NULL;
+}
 
 static mbedtls_pk_context *
 mbedtls_getkey(void)

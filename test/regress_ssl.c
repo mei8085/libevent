@@ -767,6 +767,612 @@ end:
 		event_base_loop(base, EVLOOP_ONCE);
 }
 
+/* =========================================================================
+ * TLS callback-ordering / error-visibility / ownership regression tests.
+ *
+ * A TLS handshake failure, the underlying connection closing and a user
+ * callback freeing the bufferevent all interleave inside one event-loop
+ * dispatch.  These tests pin down:
+ *   1. An authentication failure is reported as BEV_EVENT_ERROR and is not
+ *      masked by an ordinary close (BEV_EVENT_EOF).
+ *   2. Freeing the bufferevent from inside its own callback does not lead to
+ *      a use-after-free or a double free: no further callback touches the
+ *      destroyed object.
+ *   3. After a failed handshake, an independent connection on the same base
+ *      still completes a normal handshake and exchanges data.
+ *
+ * The code below is backend neutral; the small SSL-creation differences are
+ * hidden behind the ssl_test_* helpers provided by regress_openssl.c and
+ * regress_mbedtls.c.
+ * ========================================================================= */
+
+enum ssl_cb_test_type {
+	SSL_CB_SOCKETPAIR = 1,
+	SSL_CB_FILTER = 2,
+	/* Deliver callbacks directly instead of via the deferred queue. */
+	SSL_CB_IMMEDIATE = 4,
+	/* Free the bufferevent from inside the error/event callback. */
+	SSL_CB_FREE_IN_EVENTCB = 8,
+};
+
+/* One recorded event-callback invocation. */
+struct ssl_cb_event_record {
+	short what;
+	unsigned long ssl_error; /* backend error captured at callback time */
+};
+
+#define SSL_CB_MAX_EVENTS 16
+
+struct ssl_cb_waiter;
+
+struct ssl_cb_state
+{
+	int side; /* 0 = client, 1 = server */
+	int use_filter;
+	int free_in_eventcb;
+
+	struct bufferevent *bev;
+
+	/* Event ordering/visibility bookkeeping. */
+	struct ssl_cb_event_record events[SSL_CB_MAX_EVENTS];
+	int n_events;
+	int n_connected;
+	int n_error;
+	int n_eof;
+	int freed; /* set when the callback frees the bev */
+
+	/* Bytes drained by the read callback (ping/pong checks). */
+	int n_read;
+
+	/* Set while a drain is active; consulted by the callbacks to stop the
+	 * loop as soon as the awaited condition is met. */
+	struct ssl_cb_waiter *waiter;
+};
+
+/* How long a drain is allowed to wait for its predicate before the safety
+ * timer forces the loop to stop.  A healthy run reaches the predicate in a
+ * handful of callbacks and never comes close to this. */
+#define SSL_CB_DRAIN_TIMEOUT_SECS 5
+
+enum ssl_cb_wait_mode {
+	SSL_CB_WAIT_TERMINAL,    /* both sides hit error/eof/timeout */
+	SSL_CB_WAIT_CONNECTED,   /* both sides handshaked */
+	SSL_CB_WAIT_DATA,        /* both sides received application data */
+};
+
+struct ssl_cb_waiter
+{
+	struct event_base *base;
+	struct event guard;          /* one-shot safety timer */
+	enum ssl_cb_wait_mode mode;
+	const struct ssl_cb_state *client;
+	const struct ssl_cb_state *server;
+	int timed_out;
+};
+
+static int
+ssl_cb_state_terminal(const struct ssl_cb_state *st)
+{
+	/* A state whose bev was released in-callback can never produce another
+	 * event, so treat it as already settled rather than waiting on it. */
+	if (st->freed)
+		return 1;
+	return (st->n_error + st->n_eof) > 0;
+}
+
+static int
+ssl_cb_state_data_done(const struct ssl_cb_state *st)
+{
+	if (st->freed)
+		return 1;
+	return st->n_read >= 1;
+}
+
+static int
+ssl_cb_waiter_done(const struct ssl_cb_waiter *w)
+{
+	switch (w->mode) {
+	case SSL_CB_WAIT_TERMINAL:
+		return ssl_cb_state_terminal(w->client) &&
+		    ssl_cb_state_terminal(w->server);
+	case SSL_CB_WAIT_CONNECTED:
+		return w->client->n_connected >= 1 &&
+		    w->server->n_connected >= 1;
+	case SSL_CB_WAIT_DATA:
+		return ssl_cb_state_data_done(w->client) &&
+		    ssl_cb_state_data_done(w->server);
+	default:
+		return 1;
+	}
+}
+
+static void
+ssl_cb_guard_cb(evutil_socket_t fd, short what, void *arg)
+{
+	struct ssl_cb_waiter *w = arg;
+	(void)fd;
+	(void)what;
+	w->timed_out = 1;
+	event_base_loopbreak(w->base);
+}
+
+/* Re-evaluated from inside the event callback: as soon as both states meet
+ * the wait condition we stop, so healthy tests do not pay the full timeout. */
+static void
+ssl_cb_waiter_maybe_stop(struct ssl_cb_waiter *w)
+{
+	if (w && !w->timed_out && ssl_cb_waiter_done(w))
+		event_base_loopbreak(w->base);
+}
+
+static void
+ssl_cb_waiter_init(struct ssl_cb_waiter *w, struct event_base *base,
+    enum ssl_cb_wait_mode mode,
+    const struct ssl_cb_state *client, const struct ssl_cb_state *server)
+{
+	struct timeval limit = { SSL_CB_DRAIN_TIMEOUT_SECS, 0 };
+	memset(w, 0, sizeof(*w));
+	w->base = base;
+	w->mode = mode;
+	w->client = client;
+	w->server = server;
+	evtimer_assign(&w->guard, base, ssl_cb_guard_cb, w);
+	event_add(&w->guard, &limit);
+}
+
+static void
+ssl_cb_waiter_fini(struct ssl_cb_waiter *w)
+{
+	event_del(&w->guard);
+}
+
+/* Drive the loop until the waiter predicate is satisfied or the guard timer
+ * fires.  Returns 0 on success, nonzero on timeout. */
+static int
+ssl_cb_drain(struct ssl_cb_waiter *w)
+{
+	event_base_dispatch(w->base);
+	return w->timed_out ? -1 : 0;
+}
+
+static void
+ssl_cb_record_event(struct ssl_cb_state *st, short what)
+{
+	unsigned long ssl_error;
+
+	tt_assert(st->n_events < SSL_CB_MAX_EVENTS);
+	/* Capture the backend error for diagnostics.  The authoritative failure
+	 * signal is the BEV_EVENT_ERROR flag below: a backend may expose no
+	 * numeric code here (for example when its error queue was already
+	 * drained), so the tests assert on the event flags, not this value. */
+	ssl_error = ssl_test_get_error(st->bev);
+	st->events[st->n_events].what = what;
+	st->events[st->n_events].ssl_error = ssl_error;
+	TT_BLATHER(("ssl_cb[%s] record what=0x%x side=%d ssl_error=%lu",
+		SSL_TEST_BACKEND_NAME, (int)what, st->side, ssl_error));
+	st->n_events++;
+
+	if (what & BEV_EVENT_CONNECTED)
+		++st->n_connected;
+	if (what & BEV_EVENT_ERROR)
+		++st->n_error;
+	if (what & BEV_EVENT_EOF)
+		++st->n_eof;
+end:
+	;
+}
+
+static void
+ssl_cb_eventcb(struct bufferevent *bev, short what, void *arg)
+{
+	struct ssl_cb_state *st = arg;
+
+	ssl_cb_record_event(st, what);
+	/* Stop early once the awaited condition (e.g. both terminal) is met.
+	 * Do this before any free below so the waiter still points at valid
+	 * state. */
+	ssl_cb_waiter_maybe_stop(st->waiter);
+
+	if (what & (BEV_EVENT_ERROR | BEV_EVENT_EOF | BEV_EVENT_TIMEOUT)) {
+		if (st->free_in_eventcb) {
+			TT_BLATHER(("ssl_cb[%s]: freeing bev %p from eventcb",
+				SSL_TEST_BACKEND_NAME, bev));
+			st->freed = 1;
+			bufferevent_free(bev);
+			/* No further use of bev or st is permitted; the
+			 * deferred-callback machinery must not re-enter. */
+			return;
+		}
+	}
+}
+
+static void
+ssl_cb_readcb(struct bufferevent *bev, void *arg)
+{
+	struct ssl_cb_state *st = arg;
+	struct evbuffer *input = bufferevent_get_input(bev);
+	size_t len = evbuffer_get_length(input);
+
+	tt_assert(!st->freed);
+	st->n_read += (int)len;
+	evbuffer_drain(input, len);
+
+	/* Client sends "ping", server answers "pong", client drains it. */
+	if (st->side == 1) {
+		evbuffer_add_printf(bufferevent_get_output(bev), "pong");
+	}
+	ssl_cb_waiter_maybe_stop(st->waiter);
+end:
+	;
+}
+
+/* Build one SSL bufferevent (socket or filter) and wire it to st. */
+static void
+ssl_cb_make_bev(struct ssl_cb_state *st, struct event_base *base,
+    evutil_socket_t fd, SSL *ssl,
+    enum bufferevent_ssl_state ssl_state, int options)
+{
+	struct bufferevent *underlying = NULL;
+
+	if (st->use_filter) {
+		underlying = bufferevent_socket_new(base, fd, options);
+		tt_assert(underlying);
+		st->bev = bufferevent_ssl_filter_new(base, underlying, ssl,
+		    ssl_state, options);
+	} else {
+		st->bev = bufferevent_ssl_socket_new(base, fd, ssl,
+		    ssl_state, options);
+	}
+	tt_assert(st->bev);
+
+	bufferevent_setcb(st->bev, ssl_cb_readcb, NULL, ssl_cb_eventcb, st);
+end:
+	/* On a failed filter creation, release the underlying socket bev so its
+	 * fd is not leaked. */
+	if (!st->bev && underlying)
+		bufferevent_free(underlying);
+}
+
+static int
+ssl_cb_bev_options(const struct basic_test_data *data)
+{
+	enum ssl_cb_test_type type =
+	    (enum ssl_cb_test_type)(size_t)data->setup_data;
+	int options = BEV_OPT_CLOSE_ON_FREE;
+	if (!(type & SSL_CB_IMMEDIATE))
+		options |= BEV_OPT_DEFER_CALLBACKS;
+	return options;
+}
+
+/* Build a fresh connected socketpair-backed client/server SSL pair.  The
+ * client is configured so certificate verification fails. */
+static void
+ssl_cb_build_fail_pair(struct basic_test_data *data,
+    struct ssl_cb_state *client, struct ssl_cb_state *server,
+    ssl_test_verify_fail_conf_t **conf_out)
+{
+	enum ssl_cb_test_type type =
+	    (enum ssl_cb_test_type)(size_t)data->setup_data;
+	int options = ssl_cb_bev_options(data);
+	SSL *client_ssl, *server_ssl;
+
+	memset(client, 0, sizeof(*client));
+	memset(server, 0, sizeof(*server));
+	client->side = 0;
+	server->side = 1;
+	client->use_filter = server->use_filter =
+	    (type & SSL_CB_FILTER) != 0;
+	client->free_in_eventcb = server->free_in_eventcb =
+	    (type & SSL_CB_FREE_IN_EVENTCB) != 0;
+
+	*conf_out = ssl_test_new_verify_fail_client_conf();
+	client_ssl = ssl_test_new_verify_fail_client_ssl(*conf_out);
+	tt_assert(client_ssl);
+	/* Set the expected hostname: Mbed TLS 4 refuses verification without
+	 * one.  Verification still fails because no trusted CA is installed. */
+	SSL_SET_HOSTNAME(client_ssl);
+
+	server_ssl = SSL_new(get_ssl_ctx(SSL_IS_SERVER));
+	tt_assert(server_ssl);
+	SSL_use_certificate(server_ssl, the_cert);
+	SSL_use_PrivateKey(server_ssl, the_key);
+
+	ssl_cb_make_bev(client, data->base, data->pair[0], client_ssl,
+	    BUFFEREVENT_SSL_CONNECTING, options);
+	ssl_cb_make_bev(server, data->base, data->pair[1], server_ssl,
+	    BUFFEREVENT_SSL_ACCEPTING, options);
+
+	bufferevent_enable(client->bev, EV_READ | EV_WRITE);
+	bufferevent_enable(server->bev, EV_READ | EV_WRITE);
+end:
+	;
+}
+
+/* Release whatever a state still owns; safe to call after the callback freed
+ * the bev (st->bev is NULL then). */
+static void
+ssl_cb_free_state(struct ssl_cb_state *st)
+{
+	if (st->freed) {
+		st->bev = NULL;
+		return;
+	}
+	if (st->bev) {
+		bufferevent_free(st->bev);
+		st->bev = NULL;
+	}
+}
+
+/*
+ * Test 1: a certificate verification failure must surface as
+ * BEV_EVENT_ERROR on both ends and never as a plain BEV_EVENT_EOF.  When
+ * requested, the bufferevent is freed inside that very callback; afterwards
+ * no callback may touch the freed object.
+ */
+static void
+regress_ssl_cb_verify_fail(void *arg)
+{
+	struct basic_test_data *data = arg;
+	struct ssl_cb_state client, server;
+	struct ssl_cb_waiter waiter;
+	ssl_test_verify_fail_conf_t *conf = NULL;
+	int i;
+
+	ssl_cb_build_fail_pair(data, &client, &server, &conf);
+
+	client.waiter = server.waiter = &waiter;
+	ssl_cb_waiter_init(&waiter, data->base, SSL_CB_WAIT_TERMINAL,
+	    &client, &server);
+	tt_int_op(ssl_cb_drain(&waiter), ==, 0);
+	ssl_cb_waiter_fini(&waiter);
+	client.waiter = server.waiter = NULL;
+
+	/* Neither side should believe the handshake completed. */
+	tt_int_op(client.n_connected, ==, 0);
+	tt_int_op(server.n_connected, ==, 0);
+
+	/* The authentication failure is an error, not a clean close. */
+	tt_int_op(client.n_error, >=, 1);
+	tt_int_op(server.n_error, >=, 1);
+	tt_int_op(client.n_eof, ==, 0);
+	tt_int_op(server.n_eof, ==, 0);
+
+	/* Every terminal event recorded carries ERROR, never an isolated EOF. */
+	for (i = 0; i < client.n_events; ++i) {
+		short what = client.events[i].what;
+		if (what & (BEV_EVENT_ERROR | BEV_EVENT_EOF)) {
+			tt_int_op(what & BEV_EVENT_ERROR, !=, 0);
+			tt_int_op(what & BEV_EVENT_EOF, ==, 0);
+		}
+	}
+	for (i = 0; i < server.n_events; ++i) {
+		short what = server.events[i].what;
+		if (what & (BEV_EVENT_ERROR | BEV_EVENT_EOF)) {
+			tt_int_op(what & BEV_EVENT_ERROR, !=, 0);
+			tt_int_op(what & BEV_EVENT_EOF, ==, 0);
+		}
+	}
+
+	if (client.free_in_eventcb) {
+		/* The callback already released the object; process any
+		 * remaining ready events and make sure none are delivered to
+		 * the freed state (its event count must not move).  This uses
+		 * EVLOOP_NONBLOCK so it returns at once when the loop is idle
+		 * instead of blocking on the (now absent) bufferevents. */
+		int client_events_before = client.n_events;
+		int server_events_before = server.n_events;
+		client.waiter = server.waiter = NULL;
+		event_base_loop(data->base, EVLOOP_NONBLOCK);
+		event_base_loop(data->base, EVLOOP_NONBLOCK);
+		tt_int_op(client.n_events, ==, client_events_before);
+		tt_int_op(server.n_events, ==, server_events_before);
+	}
+
+end:
+	ssl_cb_free_state(&client);
+	ssl_cb_free_state(&server);
+	ssl_test_verify_fail_client_conf_free(conf);
+}
+
+/*
+ * Test 2: after a successful handshake, an ordinary peer close produces a
+ * terminal event without any spurious post-close handshake notification.
+ * With the socket backend and dirty-shutdown allowed the close is reported as
+ * BEV_EVENT_EOF (the filter backend currently reports ERROR for the same
+ * underlying close; see the mode-aware assertions below).  Either way this
+ * contrasts with the verify-failure test, which is always an ERROR even with
+ * dirty-shutdown enabled.  The client bev is released outside a callback while
+ * the server side frees itself inside its terminal callback, exercising both
+ * ownership paths.
+ */
+static void
+regress_ssl_cb_clean_close(void *arg)
+{
+	struct basic_test_data *data = arg;
+	enum ssl_cb_test_type type =
+	    (enum ssl_cb_test_type)(size_t)data->setup_data;
+	int options = ssl_cb_bev_options(data);
+	struct ssl_cb_state client, server;
+	struct ssl_cb_waiter waiter;
+	SSL *client_ssl, *server_ssl;
+
+	memset(&client, 0, sizeof(client));
+	memset(&server, 0, sizeof(server));
+	client.side = 0;
+	server.side = 1;
+	client.use_filter = server.use_filter =
+	    (type & SSL_CB_FILTER) != 0;
+	/* This variant always frees from the callback to exercise ownership. */
+	client.free_in_eventcb = server.free_in_eventcb = 1;
+
+	client_ssl = SSL_new(get_ssl_ctx(SSL_IS_CLIENT));
+	tt_assert(client_ssl);
+	SSL_SET_HOSTNAME(client_ssl);
+
+	server_ssl = SSL_new(get_ssl_ctx(SSL_IS_SERVER));
+	tt_assert(server_ssl);
+	SSL_use_certificate(server_ssl, the_cert);
+	SSL_use_PrivateKey(server_ssl, the_key);
+
+	ssl_cb_make_bev(&client, data->base, data->pair[0], client_ssl,
+	    BUFFEREVENT_SSL_CONNECTING, options);
+	ssl_cb_make_bev(&server, data->base, data->pair[1], server_ssl,
+	    BUFFEREVENT_SSL_ACCEPTING, options);
+
+	/* A peer that simply drops the connection (no TLS close_notify) must
+	 * look like an ordinary EOF, not a protocol error.  This is the
+	 * contrast that proves the verify-failure test's ERROR result really
+	 * reflects the authentication failure. */
+	bufferevent_ssl_set_allow_dirty_shutdown(client.bev, 1);
+	bufferevent_ssl_set_allow_dirty_shutdown(server.bev, 1);
+
+	bufferevent_enable(client.bev, EV_READ | EV_WRITE);
+	bufferevent_enable(server.bev, EV_READ | EV_WRITE);
+
+	/* Wait for the handshake to complete on both sides. */
+	client.waiter = server.waiter = &waiter;
+	ssl_cb_waiter_init(&waiter, data->base, SSL_CB_WAIT_CONNECTED,
+	    &client, &server);
+	tt_int_op(ssl_cb_drain(&waiter), ==, 0);
+	ssl_cb_waiter_fini(&waiter);
+	tt_int_op(client.n_connected, ==, 1);
+	tt_int_op(server.n_connected, ==, 1);
+
+	/* Close the client side from outside a callback. */
+	client.waiter = NULL;
+	bufferevent_free(client.bev);
+	client.bev = NULL;
+	client.freed = 1;
+
+	/* The server should observe the peer going away as a terminal event.
+	 * With the socket backend and dirty-shutdown allowed, an abrupt close is
+	 * an ordinary EOF.  The filter backend currently surfaces the same
+	 * underlying close through be_ssl_eventcb() as an ERROR, so there we
+	 * only require a terminal event without a spurious post-close CONNECTED.
+	 * Either way it must never be confused with the verify-failure case,
+	 * which always carries ERROR even with dirty-shutdown enabled. */
+	ssl_cb_waiter_init(&waiter, data->base, SSL_CB_WAIT_TERMINAL,
+	    &client, &server);
+	server.waiter = &waiter;
+	tt_int_op(ssl_cb_drain(&waiter), ==, 0);
+	ssl_cb_waiter_fini(&waiter);
+	server.waiter = NULL;
+	tt_int_op(server.n_eof + server.n_error, >=, 1);
+	if (!server.use_filter) {
+		tt_int_op(server.n_eof, >=, 1);
+		tt_int_op(server.n_error, ==, 0);
+	}
+	/* The closed peer must never produce another handshake event. */
+	tt_int_op(server.n_connected, ==, 1);
+
+end:
+	ssl_cb_free_state(&client);
+	ssl_cb_free_state(&server);
+}
+
+/*
+ * Test 3: after a failed handshake, a fully independent connection on the
+ * same event base still completes a normal handshake and exchanges data.
+ * This guards against the failure poisoning global/base state.
+ */
+static void
+regress_ssl_cb_recover_after_fail(void *arg)
+{
+	struct basic_test_data *data = arg;
+	enum ssl_cb_test_type type =
+	    (enum ssl_cb_test_type)(size_t)data->setup_data;
+	int options = ssl_cb_bev_options(data);
+	struct ssl_cb_state bad_client, bad_server;
+	struct ssl_cb_waiter waiter;
+	ssl_test_verify_fail_conf_t *conf = NULL;
+	evutil_socket_t good_pair[2] =
+	    { EVUTIL_INVALID_SOCKET, EVUTIL_INVALID_SOCKET };
+	struct ssl_cb_state good_client, good_server;
+	SSL *client_ssl, *server_ssl;
+	int good_pair_built = 0;
+
+	/* Phase 1: a failing connection on the shared base. */
+	ssl_cb_build_fail_pair(data, &bad_client, &bad_server, &conf);
+	bad_client.waiter = bad_server.waiter = &waiter;
+	ssl_cb_waiter_init(&waiter, data->base, SSL_CB_WAIT_TERMINAL,
+	    &bad_client, &bad_server);
+	tt_int_op(ssl_cb_drain(&waiter), ==, 0);
+	ssl_cb_waiter_fini(&waiter);
+	bad_client.waiter = bad_server.waiter = NULL;
+	tt_int_op(bad_client.n_error, >=, 1);
+	tt_int_op(bad_server.n_error, >=, 1);
+	tt_int_op(bad_client.n_connected, ==, 0);
+
+	ssl_cb_free_state(&bad_client);
+	ssl_cb_free_state(&bad_server);
+	ssl_test_verify_fail_client_conf_free(conf);
+	conf = NULL;
+
+	/* Phase 2: a brand new, correctly configured connection. */
+	tt_int_op(evutil_socketpair(AF_UNIX,
+		SOCK_STREAM | EVUTIL_SOCK_NONBLOCK, 0, good_pair), ==, 0);
+	good_pair_built = 1;
+
+	memset(&good_client, 0, sizeof(good_client));
+	memset(&good_server, 0, sizeof(good_server));
+	good_client.side = 0;
+	good_server.side = 1;
+	good_client.use_filter = good_server.use_filter =
+	    (type & SSL_CB_FILTER) != 0;
+
+	client_ssl = SSL_new(get_ssl_ctx(SSL_IS_CLIENT));
+	tt_assert(client_ssl);
+	SSL_SET_HOSTNAME(client_ssl);
+
+	server_ssl = SSL_new(get_ssl_ctx(SSL_IS_SERVER));
+	tt_assert(server_ssl);
+	SSL_use_certificate(server_ssl, the_cert);
+	SSL_use_PrivateKey(server_ssl, the_key);
+
+	ssl_cb_make_bev(&good_client, data->base, good_pair[0], client_ssl,
+	    BUFFEREVENT_SSL_CONNECTING, options);
+	ssl_cb_make_bev(&good_server, data->base, good_pair[1], server_ssl,
+	    BUFFEREVENT_SSL_ACCEPTING, options);
+	tt_assert(good_client.bev && good_server.bev);
+
+	bufferevent_enable(good_client.bev, EV_READ | EV_WRITE);
+	bufferevent_enable(good_server.bev, EV_READ | EV_WRITE);
+
+	/* Wait for the handshake, then send a ping and expect a pong. */
+	good_client.waiter = good_server.waiter = &waiter;
+	ssl_cb_waiter_init(&waiter, data->base, SSL_CB_WAIT_CONNECTED,
+	    &good_client, &good_server);
+	tt_int_op(ssl_cb_drain(&waiter), ==, 0);
+	ssl_cb_waiter_fini(&waiter);
+	tt_int_op(good_client.n_connected, ==, 1);
+	tt_int_op(good_server.n_connected, ==, 1);
+
+	evbuffer_add_printf(bufferevent_get_output(good_client.bev), "ping");
+	ssl_cb_waiter_init(&waiter, data->base, SSL_CB_WAIT_DATA,
+	    &good_client, &good_server);
+	tt_int_op(ssl_cb_drain(&waiter), ==, 0);
+	ssl_cb_waiter_fini(&waiter);
+	good_client.waiter = good_server.waiter = NULL;
+
+	tt_int_op(good_server.n_read, >=, 4);
+	tt_int_op(good_client.n_read, >=, 4);
+
+end:
+	/* A built bev owns and closes its fd (BEV_OPT_CLOSE_ON_FREE).  Free any
+	 * that were constructed; close a raw fd directly only when its bev was
+	 * never built. */
+	if (good_client.bev)
+		ssl_cb_free_state(&good_client);
+	else if (good_pair_built)
+		evutil_closesocket(good_pair[0]);
+	if (good_server.bev)
+		ssl_cb_free_state(&good_server);
+	else if (good_pair_built)
+		evutil_closesocket(good_pair[1]);
+	if (conf)
+		ssl_test_verify_fail_client_conf_free(conf);
+}
+
 struct testcase_t TESTCASES_NAME[] = {
 #define T(a) ((void *)(a))
 	{ "bufferevent_socketpair", regress_bufferevent_openssl,
@@ -854,6 +1460,28 @@ struct testcase_t TESTCASES_NAME[] = {
 	  TT_FORK|TT_NEED_BASE, &ssl_setup, T(REGRESS_DEFERRED_CALLBACKS) },
 	{ "bufferevent_wm_filter_defer", regress_bufferevent_openssl_wm,
 	  TT_FORK|TT_NEED_BASE, &ssl_setup, T(REGRESS_OPENSSL_FILTER|REGRESS_DEFERRED_CALLBACKS) },
+
+	/* TLS callback ordering / error visibility / ownership regressions. */
+	{ "cb_verify_fail_socketpair", regress_ssl_cb_verify_fail,
+	  TT_ISOLATED, &ssl_setup, T(SSL_CB_SOCKETPAIR) },
+	{ "cb_verify_fail_socketpair_immediate", regress_ssl_cb_verify_fail,
+	  TT_ISOLATED, &ssl_setup, T(SSL_CB_SOCKETPAIR | SSL_CB_IMMEDIATE) },
+	{ "cb_verify_fail_filter", regress_ssl_cb_verify_fail,
+	  TT_ISOLATED, &ssl_setup, T(SSL_CB_FILTER) },
+	{ "cb_verify_fail_free_in_cb_socketpair", regress_ssl_cb_verify_fail,
+	  TT_ISOLATED, &ssl_setup,
+	  T(SSL_CB_SOCKETPAIR | SSL_CB_FREE_IN_EVENTCB) },
+	{ "cb_verify_fail_free_in_cb_filter", regress_ssl_cb_verify_fail,
+	  TT_ISOLATED, &ssl_setup,
+	  T(SSL_CB_FILTER | SSL_CB_FREE_IN_EVENTCB) },
+	{ "cb_clean_close_free_in_cb_socketpair", regress_ssl_cb_clean_close,
+	  TT_ISOLATED, &ssl_setup, T(SSL_CB_SOCKETPAIR) },
+	{ "cb_clean_close_free_in_cb_filter", regress_ssl_cb_clean_close,
+	  TT_ISOLATED, &ssl_setup, T(SSL_CB_FILTER) },
+	{ "cb_recover_after_fail_socketpair", regress_ssl_cb_recover_after_fail,
+	  TT_ISOLATED, &ssl_setup, T(SSL_CB_SOCKETPAIR) },
+	{ "cb_recover_after_fail_filter", regress_ssl_cb_recover_after_fail,
+	  TT_ISOLATED, &ssl_setup, T(SSL_CB_FILTER) },
 
 #undef T
 

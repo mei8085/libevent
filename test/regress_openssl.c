@@ -47,6 +47,38 @@ EVP_PKEY *the_key;
 #define bufferevent_ssl_socket_new bufferevent_openssl_socket_new
 #define bufferevent_ssl_filter_new bufferevent_openssl_filter_new
 
+/* Helpers used by the TLS callback-ordering/ownership regression tests. */
+#define SSL_TEST_BACKEND_NAME "openssl"
+#define ssl_test_get_error(bev) bufferevent_get_openssl_error((bev))
+
+/* Pin the expected peer hostname, matching the mbedtls wrapper's
+ * SSL_SET_HOSTNAME so both backends exercise the same verification path. */
+#undef SSL_SET_HOSTNAME
+#define SSL_SET_HOSTNAME(ssl) \
+	X509_VERIFY_PARAM_set1_host(SSL_get0_param((ssl)), "example.com", 0)
+
+/* OpenSSL configures verification per-SSL, so there is no separate config
+ * object to keep alive; these macros keep the call sites backend-neutral. */
+#define ssl_test_verify_fail_conf_t void
+#define ssl_test_new_verify_fail_client_conf() ((void *)0)
+#define ssl_test_verify_fail_client_conf_free(conf) ((void)(conf))
+
+/* Create a client SSL that demands a verified peer certificate but has no
+ * trust store, so the handshake must fail with a verification error. */
+static SSL *
+ssl_test_new_verify_fail_client_ssl(void *conf)
+{
+	SSL *ssl = SSL_new(get_ssl_ctx(SSL_IS_CLIENT));
+	(void)conf;
+	tt_assert(ssl);
+	SSL_set_verify(ssl, SSL_VERIFY_PEER, NULL);
+	/* Deliberately do not load any trusted CA: the self-signed server
+	 * certificate cannot verify. */
+	return ssl;
+end:
+	return NULL;
+}
+
 struct rwcount;
 static void BIO_setup(SSL *ssl, struct rwcount *rw);
 #include "regress_ssl.c"
